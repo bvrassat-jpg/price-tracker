@@ -1,0 +1,386 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Price Tracker — PrimeAuctions</title>
+
+<!-- PWA / home-screen install -->
+<link rel="manifest" href="manifest.json" />
+<meta name="theme-color" content="#0A0A0A" />
+
+<!-- Favicon - same style as BD Field, "PT" instead of "BD" -->
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230A0A0A'/%3E%3Ctext x='16' y='22' font-family='Arial Black' font-size='10' font-weight='900' fill='%23A8832A' text-anchor='middle' letter-spacing='0.5'%3EPT%3C/text%3E%3C/svg%3E" />
+
+<!-- Apple touch icon (home screen icon on iOS) - same style as BD Field -->
+<link rel="apple-touch-icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 180 180'%3E%3Crect width='180' height='180' rx='30' fill='%230A0A0A'/%3E%3Ctext x='90' y='115' font-family='Arial Black' font-size='68' font-weight='900' fill='%23A8832A' text-anchor='middle'%3EPT%3C/text%3E%3C/svg%3E" />
+
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="Price Tracker" />
+
+<style>
+  :root {
+    --ink: #0A0A0A;
+    --ink-soft: #161616;
+    --ink-card: #121212;
+    --paper: #f6f4ef;
+    --brass: #A8832A;
+    --brass-bright: #C9A84C;
+    --drop-red: #b34a3a;
+    --line: rgba(246,244,239,0.12);
+    --text-dim: rgba(246,244,239,0.6);
+    --font-display: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+    --font-body: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body {
+    margin: 0;
+    background: var(--ink);
+    color: var(--paper);
+    font-family: var(--font-body);
+    min-height: 100vh;
+  }
+  body {
+    /* Respect the iPhone notch/home-indicator when installed standalone */
+    padding-top: env(safe-area-inset-top);
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+  header {
+    padding: 20px 16px 16px;
+    border-bottom: 1px solid var(--line);
+    position: sticky;
+    top: 0;
+    background: var(--ink);
+    z-index: 5;
+  }
+  header .eyebrow {
+    font-size: 10px;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--brass-bright);
+    margin-bottom: 6px;
+  }
+  header h1 {
+    font-family: var(--font-display);
+    font-weight: 500;
+    font-size: 24px;
+    margin: 0 0 4px;
+    letter-spacing: 0.01em;
+  }
+  header p {
+    margin: 0;
+    color: var(--text-dim);
+    font-size: 13px;
+  }
+  .controls {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+    padding: 12px 16px 14px;
+    border-bottom: 1px solid var(--line);
+  }
+  .controls select, .controls button {
+    background: var(--ink-soft);
+    color: var(--paper);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 9px 12px;
+    font-size: 13px;
+    font-family: var(--font-body);
+    cursor: pointer;
+  }
+  .controls select:disabled { opacity: 0.4; cursor: not-allowed; }
+  .controls button.active {
+    background: var(--brass);
+    border-color: var(--brass);
+    color: var(--ink);
+    font-weight: 600;
+  }
+  .controls .count {
+    font-size: 12px;
+    color: var(--text-dim);
+    width: 100%;
+    margin-top: 2px;
+  }
+  main { padding: 12px 16px 40px; }
+
+  /* Card layout - one column, built for thumbs not mice */
+  .card {
+    background: var(--ink-card);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 14px;
+    margin-bottom: 10px;
+  }
+  .card .addr {
+    font-size: 15px;
+    font-weight: 600;
+    line-height: 1.3;
+  }
+  .card .meta {
+    font-size: 12px;
+    color: var(--text-dim);
+    margin-top: 2px;
+  }
+  .card .price-row {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    margin-top: 10px;
+  }
+  .card .price {
+    font-family: var(--font-display);
+    font-size: 19px;
+  }
+  .card .agency {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-top: 10px;
+    font-size: 13px;
+    color: var(--paper);
+  }
+  .card .agency .label {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-dim);
+  }
+  .drop-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    background: rgba(179,74,58,0.15);
+    color: #e08a78;
+    border: 1px solid rgba(179,74,58,0.4);
+    border-radius: 20px;
+    padding: 4px 10px;
+    font-size: 12px;
+    font-weight: 600;
+    margin-top: 10px;
+  }
+  .card .footer-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-top: 12px;
+    gap: 10px;
+  }
+  .checked { font-size: 11px; color: var(--text-dim); }
+  .view-link {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--ink);
+    background: var(--brass-bright);
+    text-decoration: none;
+    font-size: 13px;
+    font-weight: 700;
+    border-radius: 8px;
+    padding: 10px 16px;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+  .view-link:active { background: var(--brass); }
+  .empty, .loading, .error {
+    padding: 60px 20px;
+    text-align: center;
+    color: var(--text-dim);
+    font-size: 14px;
+  }
+  .error { color: #e08a78; }
+
+  /* Slightly roomier on tablets/desktop, still single column - this is a
+     field tool, not a data-dense back-office screen */
+  @media (min-width: 700px) {
+    main { max-width: 640px; margin: 0 auto; }
+    header, .controls { padding-left: 32px; padding-right: 32px; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="eyebrow">PrimeAuctions</div>
+  <h1>Price Tracker</h1>
+  <p>Properties from your watchlist, sorted by the most recent price drop.</p>
+</header>
+
+<div class="controls">
+  <select id="region-select">
+    <option value="">All regions</option>
+    <option value="Cote d'Azur">Côte d'Azur</option>
+    <option value="Alpes">Alpes</option>
+    <option value="Geneve">Genève</option>
+    <option value="Costa del Sol">Costa del Sol</option>
+  </select>
+  <button id="filter-drops" class="active" data-filter="drops">Price drops only</button>
+  <button id="filter-all" data-filter="all">All properties</button>
+  <select id="drop-threshold">
+    <option value="0">Any drop</option>
+    <option value="5">5%+ drop</option>
+    <option value="10">10%+ drop</option>
+    <option value="15">15%+ drop</option>
+    <option value="20">20%+ drop</option>
+    <option value="20.0001">&gt;20% drop</option>
+  </select>
+  <div class="count" id="result-count"></div>
+</div>
+
+<main>
+  <div id="content" class="loading">Loading listings…</div>
+</main>
+
+<script>
+  // ---- Fill these in from your Supabase project settings (Project Settings > API) ----
+  const SUPABASE_URL = "https://yagchfkhcndkuzgkdzmv.supabase.co";
+  const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InlhZ2NoZmtoY25ka3V6Z2tkem12Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODMxNjk2MjksImV4cCI6MjA5ODc0NTYyOX0.D7zxn8FVCmlbhmFndqqFWWLWZL2mu_lI2RU73NTBTNI";
+  // The anon key is meant to be public in client-side code like this - the
+  // schema.sql sets up row-level security so it can only ever READ pt_listings
+  // and pt_watchlist, never write. Do not use the service_role key here.
+  // --------------------------------------------------------------------------
+
+  let allListings = [];
+  let currentFilter = "drops";
+  let currentRegion = "";
+  let dropThreshold = 0;
+
+  async function loadData() {
+    try {
+      const [listingsRes, watchlistRes] = await Promise.all([
+        fetch(`${SUPABASE_URL}/rest/v1/pt_listings?select=*&order=price_dropped_at.desc.nullslast,current_price.desc`, {
+          headers: { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${SUPABASE_ANON_KEY}` }
+        }),
+        fetch(`${SUPABASE_URL}/rest/v1/pt_watchlist?select=id,label,region`, {
+          headers: { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${SUPABASE_ANON_KEY}` }
+        })
+      ]);
+
+      if (!listingsRes.ok) throw new Error(`Supabase error: ${listingsRes.status}`);
+
+      const listings = await listingsRes.json();
+      const watchlist = watchlistRes.ok ? await watchlistRes.json() : [];
+      const watchlistById = Object.fromEntries(watchlist.map(w => [w.id, w]));
+
+      allListings = listings.map(l => ({
+        ...l,
+        region: watchlistById[l.watchlist_id]?.region || "—"
+      }));
+
+      render();
+    } catch (err) {
+      document.getElementById("content").innerHTML =
+        `<div class="error">Couldn't load data: ${err.message}. Check the SUPABASE_URL / SUPABASE_ANON_KEY at the top of this file.</div>`;
+    }
+  }
+
+  function formatPrice(price, currency) {
+    if (price === null || price === undefined) return "Price on request";
+    if (currency === "CHF") return "CHF " + Math.round(price).toLocaleString("fr-FR");
+    if (currency === "USD") return "$" + Math.round(price).toLocaleString("en-US") + " (USD)";
+    return Math.round(price).toLocaleString("fr-FR") + " €";
+  }
+
+  function sourceLabel(source) {
+    const names = {
+      bellesdemeures: "Belles Demeures",
+      bellespierres: "BellesPierres",
+      jamesedition: "JamesEdition",
+      realadvisor: "RealAdvisor",
+      homegate: "Homegate",
+      kyero: "Kyero",
+    };
+    return names[source] || source;
+  }
+
+  function render() {
+    let rows = allListings;
+    if (currentFilter === "drops") {
+      rows = rows.filter(l => l.price_change_amount && l.price_change_amount > 0);
+      if (dropThreshold > 0) {
+        rows = rows.filter(l => (l.price_change_pct || 0) >= dropThreshold);
+      }
+    }
+    if (currentRegion) {
+      rows = rows.filter(l => l.region === currentRegion);
+    }
+
+    document.getElementById("result-count").textContent =
+      `${rows.length} ${rows.length === 1 ? "property" : "properties"}`;
+
+    const content = document.getElementById("content");
+
+    if (rows.length === 0) {
+      content.innerHTML = `<div class="empty">No properties match this view yet. ${
+        currentFilter === "drops" ? "Price drops appear here once the tracker has run more than once on the same listings." : ""
+      }</div>`;
+      return;
+    }
+
+    content.innerHTML = rows.map(l => {
+      const dropBadge = (l.price_change_amount && l.price_change_amount > 0)
+        ? `<div class="drop-badge">▼ -${Math.round(l.price_change_amount).toLocaleString("fr-FR")} (-${l.price_change_pct}%)</div>`
+        : "";
+      const agencyRow = l.agency
+        ? `<div class="agency"><span class="label">Agency</span> ${l.agency}</div>`
+        : `<div class="agency"><span class="label">Agency</span> Not extracted — open the listing</div>`;
+      const checkedDate = l.last_checked
+        ? new Date(l.last_checked).toLocaleDateString("fr-FR", { day: "numeric", month: "short" })
+        : "—";
+
+      return `
+        <div class="card">
+          <div class="addr">${l.address || "Address unknown"}</div>
+          <div class="meta">${l.title || ""} · ${l.region} · ${sourceLabel(l.source)}</div>
+          <div class="price-row">
+            <div class="price">${formatPrice(l.current_price, l.currency)}</div>
+          </div>
+          ${dropBadge}
+          ${agencyRow}
+          <div class="footer-row">
+            <span class="checked">Checked ${checkedDate}</span>
+            <a class="view-link" href="${l.url}" target="_blank" rel="noopener">View listing ↗</a>
+          </div>
+        </div>`;
+    }).join("");
+  }
+
+  document.getElementById("filter-drops").addEventListener("click", (e) => {
+    currentFilter = "drops";
+    document.querySelectorAll(".controls button").forEach(b => b.classList.remove("active"));
+    e.target.classList.add("active");
+    document.getElementById("drop-threshold").disabled = false;
+    render();
+  });
+  document.getElementById("filter-all").addEventListener("click", (e) => {
+    currentFilter = "all";
+    document.querySelectorAll(".controls button").forEach(b => b.classList.remove("active"));
+    e.target.classList.add("active");
+    document.getElementById("drop-threshold").disabled = true;
+    render();
+  });
+  document.getElementById("drop-threshold").addEventListener("change", (e) => {
+    dropThreshold = parseFloat(e.target.value);
+    render();
+  });
+  document.getElementById("region-select").addEventListener("change", (e) => {
+    currentRegion = e.target.value;
+    render();
+  });
+
+  // Register the service worker so Android/Chrome offers a real "Add to
+  // Home Screen" / install prompt. Safe no-op if unsupported (e.g. some
+  // older iOS Safari versions still work via the manual Share > Add to
+  // Home Screen flow regardless).
+  if ("serviceWorker" in navigator) {
+    navigator.serviceWorker.register("service-worker.js").catch(() => {});
+  }
+
+  loadData();
+</script>
+
+</body>
+</html>
