@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 """
-Price Tracker — RealAdvisor scraper
+PrimeAuctions Price Tracker — multi-source scraper
 -------------------------------------------
-Fetches search-result pages from realadvisor.ch, extracts listings (price,
-address, agency, url), and logs them to Supabase so price drops over time
-become visible.
+Fetches search-result pages from bellesdemeures.com, BellesPierres.com,
+JamesEdition.com, RealAdvisor.ch, homegate.ch, and Kyero.com, extracts
+listings (price, address, agency, url), and logs them to Supabase so price
+drops over time become visible across all four PrimeAuctions regions
+(Cote d'Azur, Alpes, Geneve, Costa del Sol).
 
 IMPORTANT — read before relying on this:
-This was written from a manual inspection of RealAdvisor's rendered output
-(fetched once, structure confirmed at build time), NOT from live raw HTML
-parsing during development — I don't have network access to realadvisor.ch
-from where this was built. Run it in DIAGNOSTIC MODE first (see bottom of
-file) and eyeball a few parsed listings against the real page before you
-trust it or schedule it.
+Each source's parser was written from a manual inspection of that site's
+rendered output at build time, not from continuous live testing. Run new
+or changed watchlist entries in DIAGNOSTIC MODE first (see bottom of file)
+and eyeball a few parsed listings against the real page before trusting
+them or scheduling a real run.
 
 Setup:
     pip install requests beautifulsoup4 --break-system-packages
@@ -316,9 +317,6 @@ def parse_homegate(html: str):
     return results
 
 
-
-
-
 def parse_kyero(html: str):
     """
     Extract listings from a kyero.com search-results page (Costa del Sol /
@@ -385,9 +383,6 @@ def parse_kyero(html: str):
         })
 
     return results
-
-
-
 
 
 def parse_jamesedition(html: str):
@@ -474,9 +469,6 @@ def parse_jamesedition(html: str):
     return results
 
 
-
-
-
 def parse_bellespierres(html: str):
     """
     Extract listings from a bellespierres.com search-results page.
@@ -547,9 +539,6 @@ def parse_bellespierres(html: str):
         })
 
     return results
-
-
-
 
 
 PARSERS = {
@@ -695,6 +684,37 @@ def fetch_page(url):
     return r.text
 
 
+BLOCK_SIGNALS = [
+    "captcha", "are you a robot", "access denied", "attention required",
+    "unusual traffic", "cloudflare", "datadome", "please verify",
+    "enable javascript", "just a moment",
+]
+
+
+def diagnose_empty_page(html: str, status_code: int):
+    """
+    Called only when a page parsed to 0 listings in diagnose mode. Doesn't
+    guess why - prints concrete evidence so a human can tell the difference
+    between "site blocked us" and "page structure changed" at a glance.
+    """
+    print(f"    HTTP status: {status_code}")
+    print(f"    Response size: {len(html):,} characters")
+
+    lowered = html.lower()
+    found_signals = [s for s in BLOCK_SIGNALS if s in lowered]
+    if found_signals:
+        print(f"    Possible bot-block signal(s) found in page text: {found_signals}")
+    else:
+        print("    No obvious bot-block keywords found - looks like a normal page, "
+              "so the parser's selectors likely don't match this page's current structure.")
+
+    # Print a short, human-readable snippet so you can eyeball what actually
+    # came back, without dumping the whole page
+    visible_text = BeautifulSoup(html, "html.parser").get_text(" ", strip=True)
+    print(f"    First 300 characters of visible page text:")
+    print(f"    \"{visible_text[:300]}\"")
+
+
 def run(diagnose_id=None):
     if not diagnose_id and (not SUPABASE_URL or not SUPABASE_KEY):
         sys.exit("Set SUPABASE_URL and SUPABASE_KEY env vars first.")
@@ -721,13 +741,18 @@ def run(diagnose_id=None):
         for page in range(1, max_pages + 1):
             page_url = paginate_url(entry["search_url"], page, source)
             try:
-                html = fetch_page(page_url)
+                resp = requests.get(page_url, headers=HEADERS_BROWSER, timeout=30)
+                status_code = resp.status_code
+                resp.raise_for_status()
+                html = resp.text
             except requests.HTTPError as e:
                 print(f"  page {page}: request failed ({e}), stopping pagination for this entry")
                 break
             listings = parser(html)
             if not listings:
                 print(f"  page {page}: 0 listings parsed, stopping pagination")
+                if diagnose_id:
+                    diagnose_empty_page(html, status_code)
                 break
             print(f"  page {page}: {len(listings)} listings parsed")
             all_listings.extend(listings)
