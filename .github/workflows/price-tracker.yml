@@ -1,0 +1,39 @@
+name: price-tracker
+
+on:
+  schedule:
+    - cron: "0 6 * * *"   # daily at 06:00 UTC - the real automated run
+  workflow_dispatch:        # lets you trigger it manually from the Actions tab
+    inputs:
+      diagnose_id:
+        description: "Watchlist id to test in diagnose mode (leave blank for a real run)"
+        required: false
+        default: ""
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4
+
+      - name: Run scraper (diagnose mode)
+        if: ${{ github.event.inputs.diagnose_id != '' }}
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: python scraper.py --diagnose ${{ github.event.inputs.diagnose_id }}
+
+      - name: Run scraper (real run)
+        if: ${{ github.event.inputs.diagnose_id == '' }}
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: python scraper.py
