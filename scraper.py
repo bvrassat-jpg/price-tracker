@@ -3,10 +3,18 @@
 PrimeAuctions Price Tracker — multi-source scraper
 -------------------------------------------
 Fetches search-result pages from bellesdemeures.com, BellesPierres.com,
-JamesEdition.com, RealAdvisor.ch, homegate.ch, and Kyero.com, extracts
-listings (price, address, agency, url), and logs them to Supabase so price
-drops over time become visible across all four PrimeAuctions regions
-(Cote d'Azur, Alpes, Geneve, Costa del Sol).
+JamesEdition.com, RealAdvisor.ch, homegate.ch, Kyero.com, and
+LuxuryEstate.com, extracts listings (price, address, agency, url), and
+logs them to Supabase so price drops over time become visible across all
+four PrimeAuctions regions (Cote d'Azur, Alpes, Geneve, Costa del Sol).
+
+STATUS AS OF JULY 2026: bellesdemeures and bien'ici require JavaScript
+rendering (plain requests sees an empty shell - not built as a source
+here for that reason). BellesPierres, JamesEdition, and homegate return
+403 Forbidden even from a residential IP - not just a GitHub Actions
+datacenter block, something about the request itself is being detected.
+Only realadvisor and luxuryestate are confirmed working with a plain
+script as of this writing.
 
 IMPORTANT — read before relying on this:
 Each source's parser was written from a manual inspection of that site's
@@ -254,6 +262,9 @@ def paginate_url(base_url: str, page: int, source: str) -> str:
         param = "ep" if source == "homegate" else "page"
         sep = "&" if "?" in base_url else "?"
         return f"{base_url}{sep}{param}={page}"
+    if source == "luxuryestate":
+        sep = "&" if "?" in base_url else "?"
+        return f"{base_url}{sep}pag={page}"
     return base_url
 
 
@@ -541,6 +552,69 @@ def parse_bellespierres(html: str):
     return results
 
 
+def parse_luxuryestate(html: str):
+    """
+    Extract listings from a luxuryestate.com search-results page (confirmed
+    reachable with a plain script — no JS-rendering, no 403 block, unlike
+    bellesdemeures/bien'ici and BellesPierres/JamesEdition/homegate).
+
+    Structure (inferred from one manual fetch, NOT yet eyeballed against
+    live diagnose output — treat this parser as unverified until you've
+    run --diagnose on a real watchlist entry and checked a few results):
+    each listing's title anchor has the form
+        <a href="https://www.luxuryestate.com/p{ID}-{type}-for-sale-{city}">
+            Villa in Nice, Alpes-Maritimes
+        </a>
+    followed (within the same card, before the next listing's title anchor)
+    by a price line "€ 6,800,000", a size/rooms line "278 m² 3 4", a
+    description paragraph, and an agency credit line "Presented by
+    {agency name}".
+
+    Returns a list of dicts: external_id, url, title, address, agency,
+    currency ("EUR"), price, price_per_sqm (always None - not shown)
+    """
+    results = []
+
+    anchor_re = re.compile(
+        r'<a[^>]+href="(https://www\.luxuryestate\.com/p(\d+)-[a-z0-9-]+)"[^>]*>'
+        r'\s*([A-Za-z][A-Za-z \'-]*?)\s+in\s+([^<]+?)\s*</a>',
+        re.UNICODE,
+    )
+    matches = list(anchor_re.finditer(html))
+
+    for i, m in enumerate(matches):
+        url, pid, prop_type, location = m.group(1), m.group(2), m.group(3), m.group(4)
+
+        chunk_end = matches[i + 1].start() if i + 1 < len(matches) else m.end() + 3000
+        chunk_html = html[m.end():chunk_end]
+        chunk_text = BeautifulSoup(chunk_html, "html.parser").get_text(" ", strip=True)
+
+        price_match = re.search(r'€\s*([\d,]+)', chunk_text)
+        price = safe_float(price_match.group(1)) if price_match else None
+
+        sqm_match = re.search(r'([\d,]+)\s*m[²2]', chunk_text)
+        surface = safe_float(sqm_match.group(1)) if sqm_match else None
+        price_per_sqm = round(price / surface, 0) if price and surface else None
+
+        agency = None
+        agency_match = re.search(r'Presented by\s+([^<\n]{2,80}?)(?:\s*Contact|\s*Elite|\s*Prestige|\s*Premium|$)', chunk_text)
+        if agency_match:
+            agency = agency_match.group(1).strip()
+
+        results.append({
+            "external_id": pid,
+            "url": url,
+            "title": prop_type.strip(),
+            "address": location.strip(),
+            "agency": agency,
+            "currency": "EUR",
+            "price": price,
+            "price_per_sqm": price_per_sqm,
+        })
+
+    return results
+
+
 PARSERS = {
     "realadvisor": parse_realadvisor,
     "bellesdemeures": parse_bellesdemeures,
@@ -548,6 +622,7 @@ PARSERS = {
     "kyero": parse_kyero,
     "jamesedition": parse_jamesedition,
     "bellespierres": parse_bellespierres,
+    "luxuryestate": parse_luxuryestate,
 }
 
 
