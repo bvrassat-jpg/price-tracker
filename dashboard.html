@@ -20,6 +20,11 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
 <meta name="apple-mobile-web-app-title" content="Price Tracker" />
 
+<!-- Same fonts as BD Field, for visual consistency across PrimeAuctions tools -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@500;600&family=DM+Sans:wght@400;500;700&display=swap" rel="stylesheet">
+
 <style>
   :root {
     --ink: #0A0A0A;
@@ -31,8 +36,8 @@
     --drop-red: #b34a3a;
     --line: rgba(246,244,239,0.12);
     --text-dim: rgba(246,244,239,0.6);
-    --font-display: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
-    --font-body: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    --font-display: "Cormorant Garamond", "Iowan Old Style", Georgia, serif;
+    --font-body: "DM Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
   }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
   html, body {
@@ -43,7 +48,6 @@
     min-height: 100vh;
   }
   body {
-    /* Respect the iPhone notch/home-indicator when installed standalone */
     padding-top: env(safe-area-inset-top);
     padding-bottom: env(safe-area-inset-bottom);
   }
@@ -64,10 +68,10 @@
   }
   header h1 {
     font-family: var(--font-display);
-    font-weight: 500;
+    font-weight: 600;
     font-size: 24px;
     margin: 0 0 4px;
-    letter-spacing: 0.01em;
+    letter-spacing: -0.5px;
   }
   header p {
     margin: 0;
@@ -107,7 +111,6 @@
   }
   main { padding: 12px 16px 40px; }
 
-  /* Card layout - one column, built for thumbs not mice */
   .card {
     background: var(--ink-card);
     border: 1px solid var(--line);
@@ -162,6 +165,35 @@
     font-weight: 600;
     margin-top: 10px;
   }
+  .dismiss-btn {
+    background: none;
+    border: 1px solid rgba(224,138,120,0.5);
+    color: inherit;
+    border-radius: 12px;
+    padding: 2px 8px;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    cursor: pointer;
+    margin-left: 4px;
+  }
+  .dismiss-btn:hover {
+    background: rgba(224,138,120,0.15);
+  }
+  .new-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    background: rgba(168,131,42,0.15);
+    color: var(--brass-bright);
+    border: 1px solid rgba(168,131,42,0.4);
+    border-radius: 20px;
+    padding: 3px 9px;
+    font-size: 11px;
+    font-weight: 600;
+    margin-left: 8px;
+  }
   .card .footer-row {
     display: flex;
     align-items: center;
@@ -193,8 +225,6 @@
   }
   .error { color: #e08a78; }
 
-  /* Slightly roomier on tablets/desktop, still single column - this is a
-     field tool, not a data-dense back-office screen */
   @media (min-width: 700px) {
     main { max-width: 640px; margin: 0 auto; }
     header, .controls { padding-left: 32px; padding-right: 32px; }
@@ -206,7 +236,7 @@
 <header>
   <div class="eyebrow">PrimeAuctions</div>
   <h1>Price Tracker</h1>
-  <p>Properties from your watchlist, sorted by the most recent price drop.</p>
+  <p>Properties from your watchlist. Recently-dropped properties appear first, then everything else by price (highest first).</p>
 </header>
 
 <div class="controls">
@@ -235,13 +265,8 @@
 </main>
 
 <script>
-  // ---- Fill these in from your Supabase project settings (Project Settings > API) ----
   const SUPABASE_URL = "https://yagchfkhcndkuzgkdzmv.supabase.co";
   const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InlhZ2NoZmtoY25ka3V6Z2tkem12Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODMxNjk2MjksImV4cCI6MjA5ODc0NTYyOX0.D7zxn8FVCmlbhmFndqqFWWLWZL2mu_lI2RU73NTBTNI";
-  // The anon key is meant to be public in client-side code like this - the
-  // schema.sql sets up row-level security so it can only ever READ pt_listings
-  // and pt_watchlist, never write. Do not use the service_role key here.
-  // --------------------------------------------------------------------------
 
   let allListings = [];
   let currentFilter = "drops";
@@ -292,6 +317,7 @@
       realadvisor: "RealAdvisor",
       homegate: "Homegate",
       kyero: "Kyero",
+      luxuryestate: "LuxuryEstate",
     };
     return names[source] || source;
   }
@@ -299,7 +325,7 @@
   function render() {
     let rows = allListings;
     if (currentFilter === "drops") {
-      rows = rows.filter(l => l.price_change_amount && l.price_change_amount > 0);
+      rows = rows.filter(l => l.price_change_amount && l.price_change_amount > 0 && !l.dismissed_at);
       if (dropThreshold > 0) {
         rows = rows.filter(l => (l.price_change_pct || 0) >= dropThreshold);
       }
@@ -321,9 +347,14 @@
     }
 
     content.innerHTML = rows.map(l => {
-      const dropBadge = (l.price_change_amount && l.price_change_amount > 0)
-        ? `<div class="drop-badge">▼ -${Math.round(l.price_change_amount).toLocaleString("fr-FR")} (-${l.price_change_pct}%)</div>`
+      const hasActiveDrop = l.price_change_amount && l.price_change_amount > 0 && !l.dismissed_at;
+      const dropBadge = hasActiveDrop
+        ? `<div class="drop-badge">▼ -${Math.round(l.price_change_amount).toLocaleString("fr-FR")} (-${l.price_change_pct}%)
+             <button class="dismiss-btn" onclick="dismissDrop(${l.id})" title="Mark as seen/handled">Dismiss</button>
+           </div>`
         : "";
+      const isNew = l.first_seen && (Date.now() - new Date(l.first_seen).getTime()) < NEW_LISTING_MS;
+      const newBadge = isNew ? `<div class="new-badge">🆕 New listing</div>` : "";
       const agencyRow = l.agency
         ? `<div class="agency"><span class="label">Agency</span> ${l.agency}</div>`
         : `<div class="agency"><span class="label">Agency</span> Not extracted — open the listing</div>`;
@@ -332,11 +363,12 @@
         : "—";
 
       return `
-        <div class="card">
+        <div class="card" id="card-${l.id}">
           <div class="addr">${l.address || "Address unknown"}</div>
           <div class="meta">${l.title || ""} · ${l.region} · ${sourceLabel(l.source)}</div>
           <div class="price-row">
             <div class="price">${formatPrice(l.current_price, l.currency)}</div>
+            ${newBadge}
           </div>
           ${dropBadge}
           ${agencyRow}
@@ -346,6 +378,28 @@
           </div>
         </div>`;
     }).join("");
+  }
+
+  const NEW_LISTING_MS = 3 * 24 * 60 * 60 * 1000;
+
+  async function dismissDrop(listingId) {
+    try {
+      const res = await fetch(`${SUPABASE_URL}/rest/v1/rpc/dismiss_price_drop`, {
+        method: "POST",
+        headers: {
+          apikey: SUPABASE_ANON_KEY,
+          Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ listing_id: listingId }),
+      });
+      if (!res.ok) throw new Error(`Dismiss failed: ${res.status}`);
+      const item = allListings.find(l => l.id === listingId);
+      if (item) item.dismissed_at = new Date().toISOString();
+      render();
+    } catch (err) {
+      alert("Couldn't dismiss this drop: " + err.message);
+    }
   }
 
   document.getElementById("filter-drops").addEventListener("click", (e) => {
@@ -371,10 +425,6 @@
     render();
   });
 
-  // Register the service worker so Android/Chrome offers a real "Add to
-  // Home Screen" / install prompt. Safe no-op if unsupported (e.g. some
-  // older iOS Safari versions still work via the manual Share > Add to
-  // Home Screen flow regardless).
   if ("serviceWorker" in navigator) {
     navigator.serviceWorker.register("service-worker.js").catch(() => {});
   }
