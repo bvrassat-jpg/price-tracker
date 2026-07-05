@@ -328,6 +328,9 @@ def parse_homegate(html: str):
     return results
 
 
+
+
+
 def parse_kyero(html: str):
     """
     Extract listings from a kyero.com search-results page (Costa del Sol /
@@ -394,6 +397,9 @@ def parse_kyero(html: str):
         })
 
     return results
+
+
+
 
 
 def parse_jamesedition(html: str):
@@ -480,6 +486,9 @@ def parse_jamesedition(html: str):
     return results
 
 
+
+
+
 def parse_bellespierres(html: str):
     """
     Extract listings from a bellespierres.com search-results page.
@@ -550,6 +559,9 @@ def parse_bellespierres(html: str):
         })
 
     return results
+
+
+
 
 
 def parse_luxuryestate(html: str):
@@ -738,6 +750,33 @@ def notify_slack(item, previous_price):
         print(f"  (Slack notification failed: {e})")
 
 
+def notify_slack_source_down(entry, status_code, html):
+    """
+    Sent when a watchlist entry's FIRST page returns 0 parsed listings on a
+    real (non-diagnostic) run. This is a different signal than "few results
+    this time" - page 1 of an active 5M+ regional search returning nothing
+    at all almost always means the site blocked us or changed its page
+    structure, exactly like BellesPierres/JamesEdition/homegate did. It's
+    a separate Slack message from price-drop alerts on purpose, so a dead
+    source doesn't get lost/ignored the way it did before this session.
+    """
+    if not SLACK_WEBHOOK_URL:
+        return
+    lowered = html.lower()
+    found_signals = [s for s in BLOCK_SIGNALS if s in lowered]
+    reason = f"possible block signal(s): {found_signals}" if found_signals \
+        else "no block keywords found - page structure may have changed"
+    text = (
+        f":warning: *Source may be down* — '{entry['label']}' ({entry['source']})\n"
+        f"Page 1 returned 0 listings (HTTP {status_code}). {reason}.\n"
+        f"Run `python scraper.py --diagnose {entry['id']}` to check what's happening."
+    )
+    try:
+        requests.post(SLACK_WEBHOOK_URL, json={"text": text}, timeout=15)
+    except requests.RequestException as e:
+        print(f"  (Slack notification failed: {e})")
+
+
 def log_price_history(listing_id, price):
     if price is None:
         return
@@ -822,12 +861,21 @@ def run(diagnose_id=None):
                 html = resp.text
             except requests.HTTPError as e:
                 print(f"  page {page}: request failed ({e}), stopping pagination for this entry")
+                if not diagnose_id and page == 1:
+                    status_code = e.response.status_code if e.response is not None else 0
+                    print(f"  ALERT: page 1 request failed on a real run - notifying Slack")
+                    notify_slack_source_down(entry, status_code, "")
                 break
             listings = parser(html)
             if not listings:
                 print(f"  page {page}: 0 listings parsed, stopping pagination")
                 if diagnose_id:
                     diagnose_empty_page(html, status_code)
+                elif page == 1:
+                    # Page 1 empty on a real run is the strong "source is
+                    # probably dead" signal - alert distinctly from price drops
+                    print(f"  ALERT: page 1 empty on a real run - notifying Slack")
+                    notify_slack_source_down(entry, status_code, html)
                 break
             print(f"  page {page}: {len(listings)} listings parsed")
             all_listings.extend(listings)
