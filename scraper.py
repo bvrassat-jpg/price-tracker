@@ -328,9 +328,6 @@ def parse_homegate(html: str):
     return results
 
 
-
-
-
 def parse_kyero(html: str):
     """
     Extract listings from a kyero.com search-results page (Costa del Sol /
@@ -397,9 +394,6 @@ def parse_kyero(html: str):
         })
 
     return results
-
-
-
 
 
 def parse_jamesedition(html: str):
@@ -486,9 +480,6 @@ def parse_jamesedition(html: str):
     return results
 
 
-
-
-
 def parse_bellespierres(html: str):
     """
     Extract listings from a bellespierres.com search-results page.
@@ -559,9 +550,6 @@ def parse_bellespierres(html: str):
         })
 
     return results
-
-
-
 
 
 def parse_luxuryestate(html: str):
