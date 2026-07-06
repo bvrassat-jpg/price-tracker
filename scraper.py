@@ -721,23 +721,6 @@ def upsert_listing(watchlist_id, source, item):
 SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
 
 
-def notify_slack(item, previous_price):
-    if not SLACK_WEBHOOK_URL:
-        return
-    drop = previous_price - item["price"]
-    pct = round(100 * drop / previous_price, 1)
-    text = (
-        f":small_red_triangle_down: *Price drop* — {item['title'] or 'Property'} "
-        f"({item['address'] or 'unknown location'})\n"
-        f"{previous_price:,.0f} -> *{item['price']:,.0f} EUR* (-{pct}%)\n"
-        f"<{item['url']}|View listing>"
-    )
-    try:
-        requests.post(SLACK_WEBHOOK_URL, json={"text": text}, timeout=15)
-    except requests.RequestException as e:
-        print(f"  (Slack notification failed: {e})")
-
-
 def notify_slack_source_down(entry, status_code, html):
     """
     Sent when a watchlist entry's FIRST page returns 0 parsed listings on a
@@ -774,6 +757,172 @@ def log_price_history(listing_id, price):
         json={"listing_id": listing_id, "price": price},
         timeout=30,
     ).raise_for_status()
+
+
+# ---------------------------------------------------------------------------
+# Market-anomaly detection (Phase 1)
+# ---------------------------------------------------------------------------
+#
+# Reframes the product from "here's every price drop" to "here's whether
+# today's data suggests a genuine auction opportunity." Three signals, all
+# derived from data already being collected (no new scraping required):
+#   - days on market (first_seen -> now)
+#   - number of actual price REDUCTIONS across a listing's whole history
+#     (not just the latest check-to-check delta)
+#   - cumulative % drop from the first ever recorded price to the latest
+#
+# Deliberately a simple, inspectable point score (not a black-box
+# confidence percentage) - there's no outcome data yet to calibrate a real
+# probability against, and a fake-precise number would erode trust faster
+# than an honest, adjustable rule would.
+
+TIER_RANK = {None: 0, "green": 0, "orange": 1, "red": 2}
+TIER_EMOJI = {"orange": ":large_orange_circle:", "red": ":red_circle:"}
+
+
+def get_price_history(listing_id):
+    """All recorded prices for a listing, oldest first."""
+    r = requests.get(
+        f"{SUPABASE_URL}/rest/v1/pt_price_history"
+        f"?listing_id=eq.{listing_id}&select=price,checked_at&order=checked_at.asc",
+        headers=HEADERS_SUPABASE, timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def get_listing_alert_state(listing_id):
+    """Current alert bookkeeping for a listing, so we know whether this
+    run's computed tier is new/escalated, or already known/dismissed."""
+    r = requests.get(
+        f"{SUPABASE_URL}/rest/v1/pt_listings"
+        f"?id=eq.{listing_id}&select=first_seen,alert_tier,dismissed_at,dismissed_tier",
+        headers=HEADERS_SUPABASE, timeout=30,
+    )
+    r.raise_for_status()
+    rows = r.json()
+    return rows[0] if rows else {}
+
+
+def compute_alert(first_seen_iso, history):
+    """
+    Score a listing's history against the three Phase 1 signals.
+
+    Needs at least 2 price points to say anything meaningful - a listing
+    seen only once hasn't had a chance to show any of these signals yet,
+    so this correctly returns tier "green" (no alert) rather than guessing
+    off a single data point.
+
+    Returns {"tier": "green"|"orange"|"red", "score": int, "reasons": [str]}
+    """
+    prices = [h["price"] for h in history if h.get("price") is not None]
+    if len(prices) < 2:
+        return {"tier": "green", "score": 0, "reasons": []}
+
+    first_price = prices[0]
+    current_price = prices[-1]
+    reduction_count = sum(1 for i in range(1, len(prices)) if prices[i] < prices[i - 1])
+    cumulative_pct = round(100 * (first_price - current_price) / first_price, 1) \
+        if first_price else 0
+
+    days_on_market = None
+    if first_seen_iso:
+        try:
+            first_seen_dt = datetime.fromisoformat(first_seen_iso.replace("Z", "+00:00"))
+            days_on_market = (datetime.now(timezone.utc) - first_seen_dt).days
+        except ValueError:
+            pass
+
+    score = 0
+    reasons = []
+
+    if days_on_market is not None:
+        if days_on_market >= 365:
+            score += 3
+            reasons.append(f"{days_on_market} days on market")
+        elif days_on_market >= 180:
+            score += 1
+            reasons.append(f"{days_on_market} days on market")
+
+    if reduction_count >= 4:
+        score += 3
+        reasons.append(f"{reduction_count} price reductions")
+    elif reduction_count >= 2:
+        score += 1
+        reasons.append(f"{reduction_count} price reductions")
+
+    if cumulative_pct >= 15:
+        score += 3
+        reasons.append(f"Cumulative drop: {cumulative_pct}% ({first_price:,.0f} \u2192 {current_price:,.0f})")
+    elif cumulative_pct >= 7:
+        score += 1
+        reasons.append(f"Cumulative drop: {cumulative_pct}% ({first_price:,.0f} \u2192 {current_price:,.0f})")
+
+    if score >= 5:
+        tier = "red"
+    elif score >= 2:
+        tier = "orange"
+    else:
+        tier = "green"
+
+    return {"tier": tier, "score": score, "reasons": reasons}
+
+
+def apply_alert(listing_id, alert_state, alert, item):
+    """
+    Writes the freshly-computed tier/score/reasons to pt_listings, clears
+    a stale dismissal if the tier has escalated past what was dismissed
+    (so a previously-handled listing resurfaces if it gets worse), and
+    triggers exactly one Slack ping per new escalation - never repeats a
+    ping for a tier that's already been notified about.
+
+    Returns True if this run raised a NEW or ESCALATED orange/red alert
+    (used only for the run's summary line).
+    """
+    old_tier = alert_state.get("alert_tier")
+    dismissed_tier = alert_state.get("dismissed_tier")
+    new_tier = alert["tier"]
+
+    patch = {
+        "alert_tier": new_tier,
+        "alert_score": alert["score"],
+        "alert_reasons": "\n".join(alert["reasons"]) if alert["reasons"] else None,
+    }
+
+    if alert_state.get("dismissed_at") and TIER_RANK.get(new_tier, 0) > TIER_RANK.get(dismissed_tier, 0):
+        patch["dismissed_at"] = None
+        patch["dismissed_tier"] = None
+
+    requests.patch(
+        f"{SUPABASE_URL}/rest/v1/pt_listings?id=eq.{listing_id}",
+        headers=HEADERS_SUPABASE, json=patch, timeout=30,
+    ).raise_for_status()
+
+    escalated = new_tier in ("orange", "red") and TIER_RANK.get(new_tier, 0) > TIER_RANK.get(old_tier, 0)
+    if escalated:
+        print(f"  ALERT ({new_tier.upper()}): {item['title']} — {item['address']} — "
+              f"{'; '.join(alert['reasons'])} — {item['url']}")
+        notify_alert_slack(item, new_tier, alert["reasons"])
+
+    return escalated
+
+
+def notify_alert_slack(item, tier, reasons):
+    if not SLACK_WEBHOOK_URL:
+        return
+    emoji = TIER_EMOJI.get(tier, "")
+    label = "Strong auction signal" if tier == "red" else "Worth reviewing"
+    reason_lines = "\n".join(f"\u2022 {r}" for r in reasons)
+    text = (
+        f"{emoji} *{label}* — {item['title'] or 'Property'} "
+        f"({item['address'] or 'unknown location'})\n"
+        f"Reasons:\n{reason_lines}\n"
+        f"<{item['url']}|View listing>"
+    )
+    try:
+        requests.post(SLACK_WEBHOOK_URL, json={"text": text}, timeout=15)
+    except requests.RequestException as e:
+        print(f"  (Slack notification failed: {e})")
 
 
 # ---------------------------------------------------------------------------
@@ -825,7 +974,7 @@ def run(diagnose_id=None):
         sys.exit("Diagnostic mode still needs SUPABASE_URL/KEY to read the watchlist row.")
 
     watchlist = get_watchlist(only_id=diagnose_id)
-    drops_over_threshold = []
+    alerts_raised = []
 
     for entry in watchlist:
         source = entry["source"]
@@ -881,17 +1030,13 @@ def run(diagnose_id=None):
         for item in qualifying:
             listing_id, previous_price, is_new = upsert_listing(entry["id"], source, item)
             log_price_history(listing_id, item["price"])
-            if not is_new and previous_price is not None and item["price"] < previous_price:
-                drop = previous_price - item["price"]
-                pct = round(100 * drop / previous_price, 1)
-                drops_over_threshold.append(item)
-                print(f"  PRICE DROP: {item['title']} — {item['address']} — "
-                      f"{previous_price:,.0f} -> {item['price']:,.0f} ({pct}%) — {item['url']}")
-                notify_slack(item, previous_price)
+            alert_state = get_listing_alert_state(listing_id)
+            alert = compute_alert(alert_state.get("first_seen"), get_price_history(listing_id))
+            if apply_alert(listing_id, alert_state, alert, item):
+                alerts_raised.append(item)
 
     if not diagnose_id:
-        print(f"\n{len(drops_over_threshold)} price drop(s) found across all watchlist entries "
-              f"(only counting listings at/above each entry's min_price_eur).")
+        print(f"\n{len(alerts_raised)} new/escalated alert(s) raised across all watchlist entries.")
 
 
 if __name__ == "__main__":
