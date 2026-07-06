@@ -3,10 +3,18 @@
 PrimeAuctions Price Tracker — multi-source scraper
 -------------------------------------------
 Fetches search-result pages from bellesdemeures.com, BellesPierres.com,
-JamesEdition.com, RealAdvisor.ch, homegate.ch, and Kyero.com, extracts
-listings (price, address, agency, url), and logs them to Supabase so price
-drops over time become visible across all four PrimeAuctions regions
-(Cote d'Azur, Alpes, Geneve, Costa del Sol).
+JamesEdition.com, RealAdvisor.ch, homegate.ch, Kyero.com, and
+LuxuryEstate.com, extracts listings (price, address, agency, url), and
+logs them to Supabase so price drops over time become visible across all
+four PrimeAuctions regions (Cote d'Azur, Alpes, Geneve, Costa del Sol).
+
+STATUS AS OF JULY 2026: bellesdemeures and bien'ici require JavaScript
+rendering (plain requests sees an empty shell - not built as a source
+here for that reason). BellesPierres, JamesEdition, and homegate return
+403 Forbidden even from a residential IP - not just a GitHub Actions
+datacenter block, something about the request itself is being detected.
+Only realadvisor and luxuryestate are confirmed working with a plain
+script as of this writing.
 
 IMPORTANT — read before relying on this:
 Each source's parser was written from a manual inspection of that site's
@@ -255,7 +263,6 @@ def paginate_url(base_url: str, page: int, source: str) -> str:
         sep = "&" if "?" in base_url else "?"
         return f"{base_url}{sep}{param}={page}"
     if source == "luxuryestate":
-        # luxuryestate uses ?pag= (confirmed from the site's own "Next" link)
         sep = "&" if "?" in base_url else "?"
         return f"{base_url}{sep}pag={page}"
     return base_url
@@ -319,9 +326,6 @@ def parse_homegate(html: str):
         })
 
     return results
-
-
-
 
 
 def parse_kyero(html: str):
@@ -390,9 +394,6 @@ def parse_kyero(html: str):
         })
 
     return results
-
-
-
 
 
 def parse_jamesedition(html: str):
@@ -479,9 +480,6 @@ def parse_jamesedition(html: str):
     return results
 
 
-
-
-
 def parse_bellespierres(html: str):
     """
     Extract listings from a bellespierres.com search-results page.
@@ -554,35 +552,23 @@ def parse_bellespierres(html: str):
     return results
 
 
-
-
-
 def parse_luxuryestate(html: str):
     """
-    Extract listings from a luxuryestate.com search-results page.
+    Extract listings from a luxuryestate.com search-results page (confirmed
+    reachable with a plain script — no JS-rendering, no 403 block, unlike
+    bellesdemeures/bien'ici and BellesPierres/JamesEdition/homegate).
 
-    CAVEAT: written from the site's rendered page content (fetched via a
-    tool that converts HTML to readable text/markdown), NOT from viewing
-    raw HTML source directly. The structure below is inferred, not
-    confirmed against actual tag/class names the way realadvisor and
-    jamesedition's docstrings claim to be. Run
-        python scraper.py --diagnose <luxuryestate watchlist id>
-    before trusting this in production, and expect to need at least one
-    round of fixes against the real markup.
-
-    Observed structure: each listing has TWO anchors pointing at the same
-    URL (a photo-gallery anchor, then a title anchor) - same pattern as
-    bellespierres. URL shape:
-        https://www.luxuryestate.com/p<numeric-id>-<slug>
-    Following the second (title) anchor, in order: "<Type> in <City>,
-    <Department>", then "€ X,XXX,XXX" (or "Price on Application"), then
-    "<sqm> m² <beds> <baths>", a description paragraph, then an agency
-    link/logo and "Presented by <Agency Name>" text.
-
-    As with bellespierres, key on the LAST occurrence of each numeric ID
-    so the extraction window (the HTML between this listing's last anchor
-    and the next listing's first anchor) contains that listing's own
-    price/specs/agency rather than the next one's.
+    Structure (inferred from one manual fetch, NOT yet eyeballed against
+    live diagnose output — treat this parser as unverified until you've
+    run --diagnose on a real watchlist entry and checked a few results):
+    each listing's title anchor has the form
+        <a href="https://www.luxuryestate.com/p{ID}-{type}-for-sale-{city}">
+            Villa in Nice, Alpes-Maritimes
+        </a>
+    followed (within the same card, before the next listing's title anchor)
+    by a price line "€ 6,800,000", a size/rooms line "278 m² 3 4", a
+    description paragraph, and an agency credit line "Presented by
+    {agency name}".
 
     Returns a list of dicts: external_id, url, title, address, agency,
     currency ("EUR"), price, price_per_sqm (always None - not shown)
@@ -590,50 +576,40 @@ def parse_luxuryestate(html: str):
     results = []
 
     anchor_re = re.compile(
-        r'<a[^>]+href="(https://www\.luxuryestate\.com/(p(\d+)-[a-z0-9-]+))"'
+        r'<a[^>]+href="(https://www\.luxuryestate\.com/p(\d+)-[a-z0-9-]+)"[^>]*>'
+        r'\s*([A-Za-z][A-Za-z \'-]*?)\s+in\s+([^<]+?)\s*</a>',
+        re.UNICODE,
     )
     matches = list(anchor_re.finditer(html))
 
-    last_pos = {}   # numeric id -> (full_url, start, end)
-    order = []
-    for m in matches:
-        url, _slug, pid = m.group(1), m.group(2), m.group(3)
-        if pid not in last_pos:
-            order.append(pid)
-        last_pos[pid] = (url, m.start(), m.end())
+    for i, m in enumerate(matches):
+        url, pid, prop_type, location = m.group(1), m.group(2), m.group(3), m.group(4)
 
-    for i, pid in enumerate(order):
-        url, start, end = last_pos[pid]
-        next_start = last_pos[order[i + 1]][1] if i + 1 < len(order) else end + 4000
-        window_html = html[end:min(end + 4000, next_start)]
-        window_text = BeautifulSoup(window_html, "html.parser").get_text("\n", strip=True)
+        chunk_end = matches[i + 1].start() if i + 1 < len(matches) else m.end() + 3000
+        chunk_html = html[m.end():chunk_end]
+        chunk_text = BeautifulSoup(chunk_html, "html.parser").get_text(" ", strip=True)
 
-        price_match = re.search(r'€\s*([\d,]+)', window_text)
+        price_match = re.search(r'€\s*([\d,]+)', chunk_text)
         price = safe_float(price_match.group(1)) if price_match else None
 
-        if price is None and "Price on Application" not in window_text \
-                and "Price On Request" not in window_text:
-            continue  # couldn't parse a usable price, skip rather than store garbage
+        sqm_match = re.search(r'([\d,]+)\s*m[²2]', chunk_text)
+        surface = safe_float(sqm_match.group(1)) if sqm_match else None
+        price_per_sqm = round(price / surface, 0) if price and surface else None
 
-        type_match = re.search(
-            r'(Villa|House|Apartment|Penthouse|Ch[âa]teau|Chalet|Property)\s+in\s+([^\n,]+)',
-            window_text,
-        )
-        title = f"{type_match.group(1)} in {type_match.group(2)}" if type_match else None
-        address = type_match.group(2).strip() if type_match else None
-
-        agency_match = re.search(r'Presented by ([^\n]+)', window_text)
-        agency = agency_match.group(1).strip() if agency_match else None
+        agency = None
+        agency_match = re.search(r'Presented by\s+([^<\n]{2,80}?)(?:\s*Contact|\s*Elite|\s*Prestige|\s*Premium|$)', chunk_text)
+        if agency_match:
+            agency = agency_match.group(1).strip()
 
         results.append({
             "external_id": pid,
             "url": url,
-            "title": title,
-            "address": address,
+            "title": prop_type.strip(),
+            "address": location.strip(),
             "agency": agency,
             "currency": "EUR",
             "price": price,
-            "price_per_sqm": None,
+            "price_per_sqm": price_per_sqm,
         })
 
     return results
@@ -762,6 +738,33 @@ def notify_slack(item, previous_price):
         print(f"  (Slack notification failed: {e})")
 
 
+def notify_slack_source_down(entry, status_code, html):
+    """
+    Sent when a watchlist entry's FIRST page returns 0 parsed listings on a
+    real (non-diagnostic) run. This is a different signal than "few results
+    this time" - page 1 of an active 5M+ regional search returning nothing
+    at all almost always means the site blocked us or changed its page
+    structure, exactly like BellesPierres/JamesEdition/homegate did. It's
+    a separate Slack message from price-drop alerts on purpose, so a dead
+    source doesn't get lost/ignored the way it did before this session.
+    """
+    if not SLACK_WEBHOOK_URL:
+        return
+    lowered = html.lower()
+    found_signals = [s for s in BLOCK_SIGNALS if s in lowered]
+    reason = f"possible block signal(s): {found_signals}" if found_signals \
+        else "no block keywords found - page structure may have changed"
+    text = (
+        f":warning: *Source may be down* — '{entry['label']}' ({entry['source']})\n"
+        f"Page 1 returned 0 listings (HTTP {status_code}). {reason}.\n"
+        f"Run `python scraper.py --diagnose {entry['id']}` to check what's happening."
+    )
+    try:
+        requests.post(SLACK_WEBHOOK_URL, json={"text": text}, timeout=15)
+    except requests.RequestException as e:
+        print(f"  (Slack notification failed: {e})")
+
+
 def log_price_history(listing_id, price):
     if price is None:
         return
@@ -846,12 +849,21 @@ def run(diagnose_id=None):
                 html = resp.text
             except requests.HTTPError as e:
                 print(f"  page {page}: request failed ({e}), stopping pagination for this entry")
+                if not diagnose_id and page == 1:
+                    status_code = e.response.status_code if e.response is not None else 0
+                    print(f"  ALERT: page 1 request failed on a real run - notifying Slack")
+                    notify_slack_source_down(entry, status_code, "")
                 break
             listings = parser(html)
             if not listings:
                 print(f"  page {page}: 0 listings parsed, stopping pagination")
                 if diagnose_id:
                     diagnose_empty_page(html, status_code)
+                elif page == 1:
+                    # Page 1 empty on a real run is the strong "source is
+                    # probably dead" signal - alert distinctly from price drops
+                    print(f"  ALERT: page 1 empty on a real run - notifying Slack")
+                    notify_slack_source_down(entry, status_code, html)
                 break
             print(f"  page {page}: {len(listings)} listings parsed")
             all_listings.extend(listings)
