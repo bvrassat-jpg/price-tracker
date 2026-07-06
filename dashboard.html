@@ -153,17 +153,37 @@
     color: var(--text-dim);
   }
   .drop-badge {
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
+    display: block;
     background: rgba(179,74,58,0.15);
     color: #e08a78;
     border: 1px solid rgba(179,74,58,0.4);
-    border-radius: 20px;
-    padding: 4px 10px;
+    border-radius: 12px;
+    padding: 8px 12px;
     font-size: 12px;
     font-weight: 600;
     margin-top: 10px;
+  }
+  .drop-badge.tier-red {
+    background: rgba(179,58,58,0.18);
+    color: #f0897a;
+    border-color: rgba(179,58,58,0.45);
+  }
+  .drop-badge.tier-orange {
+    background: rgba(179,120,58,0.15);
+    color: #e0a878;
+    border-color: rgba(179,120,58,0.4);
+  }
+  .drop-badge .reasons {
+    list-style: none;
+    padding: 0;
+    margin: 6px 0 8px 0;
+    font-size: 11px;
+    font-weight: 400;
+    line-height: 1.6;
+    color: var(--text-dim);
+  }
+  .drop-badge .reasons li::before {
+    content: "• ";
   }
   .dismiss-btn {
     background: none;
@@ -236,7 +256,7 @@
 <header>
   <div class="eyebrow">PrimeAuctions</div>
   <h1>Price Tracker</h1>
-  <p>Properties from your watchlist. Recently-dropped properties appear first, then everything else by price (highest first).</p>
+  <p>Has anything happened in the market today that suggests an auction opportunity? Alerts appear first; everything else follows by price.</p>
 </header>
 
 <div class="controls">
@@ -247,15 +267,11 @@
     <option value="Geneve">Genève</option>
     <option value="Costa del Sol">Costa del Sol</option>
   </select>
-  <button id="filter-drops" class="active" data-filter="drops">Price drops only</button>
+  <button id="filter-alerts" class="active" data-filter="alerts">Alerts only</button>
   <button id="filter-all" data-filter="all">All properties</button>
-  <select id="drop-threshold">
-    <option value="0">Any drop</option>
-    <option value="5">5%+ drop</option>
-    <option value="10">10%+ drop</option>
-    <option value="15">15%+ drop</option>
-    <option value="20">20%+ drop</option>
-    <option value="20.0001">&gt;20% drop</option>
+  <select id="tier-threshold">
+    <option value="orange">🟠 Worth reviewing +</option>
+    <option value="red">🔴 Strong signal only</option>
   </select>
   <div class="count" id="result-count"></div>
 </div>
@@ -269,14 +285,14 @@
   const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InlhZ2NoZmtoY25ka3V6Z2tkem12Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODMxNjk2MjksImV4cCI6MjA5ODc0NTYyOX0.D7zxn8FVCmlbhmFndqqFWWLWZL2mu_lI2RU73NTBTNI";
 
   let allListings = [];
-  let currentFilter = "drops";
+  let currentFilter = "alerts";
   let currentRegion = "";
-  let dropThreshold = 0;
+  let tierThreshold = "orange";
 
   async function loadData() {
     try {
       const [listingsRes, watchlistRes] = await Promise.all([
-        fetch(`${SUPABASE_URL}/rest/v1/pt_listings?select=*&order=price_dropped_at.desc.nullslast,current_price.desc`, {
+        fetch(`${SUPABASE_URL}/rest/v1/pt_listings?select=*&order=alert_score.desc.nullslast,current_price.desc`, {
           headers: { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${SUPABASE_ANON_KEY}` }
         }),
         fetch(`${SUPABASE_URL}/rest/v1/pt_watchlist?select=id,label,region`, {
@@ -322,13 +338,25 @@
     return names[source] || source;
   }
 
+  const TIER_RANK = { green: 0, orange: 1, red: 2 };
+  const TIER_EMOJI = { orange: "🟠", red: "🔴" };
+  const TIER_LABEL = { orange: "Worth reviewing", red: "Strong signal" };
+
+  function isActiveAlert(l) {
+    const tier = l.alert_tier;
+    if (!tier || tier === "green") return false;
+    const dismissedTier = l.dismissed_tier;
+    // Still counts as active if it's been dismissed at a LOWER tier than
+    // its current tier (i.e. it escalated since being dismissed).
+    if (l.dismissed_at && TIER_RANK[dismissedTier] >= TIER_RANK[tier]) return false;
+    return true;
+  }
+
   function render() {
     let rows = allListings;
-    if (currentFilter === "drops") {
-      rows = rows.filter(l => l.price_change_amount && l.price_change_amount > 0 && !l.dismissed_at);
-      if (dropThreshold > 0) {
-        rows = rows.filter(l => (l.price_change_pct || 0) >= dropThreshold);
-      }
+    if (currentFilter === "alerts") {
+      rows = rows.filter(isActiveAlert);
+      rows = rows.filter(l => TIER_RANK[l.alert_tier] >= TIER_RANK[tierThreshold]);
     }
     if (currentRegion) {
       rows = rows.filter(l => l.region === currentRegion);
@@ -341,16 +369,18 @@
 
     if (rows.length === 0) {
       content.innerHTML = `<div class="empty">No properties match this view yet. ${
-        currentFilter === "drops" ? "Price drops appear here once the tracker has run more than once on the same listings." : ""
+        currentFilter === "alerts" ? "Alerts appear here once a listing's history shows a real pattern - a second reduction, a long time on market, a meaningful cumulative drop. A single price check isn't enough on its own." : ""
       }</div>`;
       return;
     }
 
     content.innerHTML = rows.map(l => {
-      const hasActiveDrop = l.price_change_amount && l.price_change_amount > 0 && !l.dismissed_at;
-      const dropBadge = hasActiveDrop
-        ? `<div class="drop-badge">▼ -${Math.round(l.price_change_amount).toLocaleString("fr-FR")} (-${l.price_change_pct}%)
-             <button class="dismiss-btn" onclick="dismissDrop(${l.id})" title="Mark as seen/handled">Dismiss</button>
+      const active = isActiveAlert(l);
+      const reasons = (l.alert_reasons || "").split("\n").filter(Boolean);
+      const alertBadge = active
+        ? `<div class="drop-badge tier-${l.alert_tier}">${TIER_EMOJI[l.alert_tier] || ""} ${TIER_LABEL[l.alert_tier] || ""}
+             <ul class="reasons">${reasons.map(r => `<li>${r}</li>`).join("")}</ul>
+             <button class="dismiss-btn" onclick="dismissAlert(${l.id})" title="Mark as seen/handled">Dismiss</button>
            </div>`
         : "";
       const isNew = l.first_seen && (Date.now() - new Date(l.first_seen).getTime()) < NEW_LISTING_MS;
@@ -370,7 +400,7 @@
             <div class="price">${formatPrice(l.current_price, l.currency)}</div>
             ${newBadge}
           </div>
-          ${dropBadge}
+          ${alertBadge}
           ${agencyRow}
           <div class="footer-row">
             <span class="checked">Checked ${checkedDate}</span>
@@ -382,9 +412,9 @@
 
   const NEW_LISTING_MS = 3 * 24 * 60 * 60 * 1000;
 
-  async function dismissDrop(listingId) {
+  async function dismissAlert(listingId) {
     try {
-      const res = await fetch(`${SUPABASE_URL}/rest/v1/rpc/dismiss_price_drop`, {
+      const res = await fetch(`${SUPABASE_URL}/rest/v1/rpc/dismiss_alert`, {
         method: "POST",
         headers: {
           apikey: SUPABASE_ANON_KEY,
@@ -395,29 +425,32 @@
       });
       if (!res.ok) throw new Error(`Dismiss failed: ${res.status}`);
       const item = allListings.find(l => l.id === listingId);
-      if (item) item.dismissed_at = new Date().toISOString();
+      if (item) {
+        item.dismissed_at = new Date().toISOString();
+        item.dismissed_tier = item.alert_tier;
+      }
       render();
     } catch (err) {
-      alert("Couldn't dismiss this drop: " + err.message);
+      alert("Couldn't dismiss this alert: " + err.message);
     }
   }
 
-  document.getElementById("filter-drops").addEventListener("click", (e) => {
-    currentFilter = "drops";
+  document.getElementById("filter-alerts").addEventListener("click", (e) => {
+    currentFilter = "alerts";
     document.querySelectorAll(".controls button").forEach(b => b.classList.remove("active"));
     e.target.classList.add("active");
-    document.getElementById("drop-threshold").disabled = false;
+    document.getElementById("tier-threshold").disabled = false;
     render();
   });
   document.getElementById("filter-all").addEventListener("click", (e) => {
     currentFilter = "all";
     document.querySelectorAll(".controls button").forEach(b => b.classList.remove("active"));
     e.target.classList.add("active");
-    document.getElementById("drop-threshold").disabled = true;
+    document.getElementById("tier-threshold").disabled = true;
     render();
   });
-  document.getElementById("drop-threshold").addEventListener("change", (e) => {
-    dropThreshold = parseFloat(e.target.value);
+  document.getElementById("tier-threshold").addEventListener("change", (e) => {
+    tierThreshold = e.target.value;
     render();
   });
   document.getElementById("region-select").addEventListener("change", (e) => {
