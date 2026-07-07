@@ -257,8 +257,8 @@ def paginate_url(base_url: str, page: int, source: str) -> str:
     if source == "bellesdemeures":
         # appends /{page}/ to the path
         return f"{base_url.rstrip('/')}/{page}/"
-    if source in ("homegate", "kyero", "jamesedition"):
-        # homegate uses ep=, kyero and jamesedition use page=
+    if source in ("homegate", "kyero", "jamesedition", "realadvisor"):
+        # homegate uses ep=, kyero/jamesedition/realadvisor use page=
         param = "ep" if source == "homegate" else "page"
         sep = "&" if "?" in base_url else "?"
         return f"{base_url}{sep}{param}={page}"
