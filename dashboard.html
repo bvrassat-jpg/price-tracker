@@ -245,9 +245,76 @@
   }
   .error { color: #e08a78; }
 
+  .status-wrap { padding: 0 16px; }
+  .status-toggle {
+    width: 100%;
+    text-align: left;
+    background: var(--ink-soft);
+    color: var(--paper);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-size: 12px;
+    font-weight: 600;
+    font-family: var(--font-body);
+    cursor: pointer;
+    margin-top: 12px;
+  }
+  .status-body { padding: 12px 2px 4px; }
+  .status-stats {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 8px;
+    margin-bottom: 12px;
+  }
+  .status-stat {
+    background: var(--ink-card);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 10px;
+    text-align: center;
+  }
+  .status-stat .num {
+    font-family: var(--font-display);
+    font-size: 20px;
+    color: var(--brass-bright);
+    line-height: 1.2;
+  }
+  .status-stat .lbl {
+    font-size: 10px;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    margin-top: 2px;
+  }
+  .status-note {
+    font-size: 12px;
+    color: var(--text-dim);
+    line-height: 1.5;
+    margin-bottom: 4px;
+  }
+  .status-lastrun {
+    font-size: 11px;
+    color: var(--text-dim);
+    margin-bottom: 14px;
+  }
+  .tier-legend {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    border-top: 1px solid var(--line);
+    padding-top: 12px;
+  }
+  .tier-legend-item {
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--text-dim);
+  }
+  .tier-legend-item strong { color: var(--paper); }
+
   @media (min-width: 700px) {
     main { max-width: 640px; margin: 0 auto; }
-    header, .controls { padding-left: 32px; padding-right: 32px; }
+    header, .controls, .status-wrap { padding-left: 32px; padding-right: 32px; }
   }
 </style>
 </head>
@@ -274,6 +341,20 @@
     <option value="red">🔴 Strong signal only</option>
   </select>
   <div class="count" id="result-count"></div>
+</div>
+
+<div class="status-wrap">
+  <button class="status-toggle" id="status-toggle">Tracking status &amp; alert guide ▾</button>
+  <div class="status-body" id="status-body" hidden>
+    <div class="status-stats" id="status-stats"></div>
+    <div class="status-note" id="status-note"></div>
+    <div class="status-lastrun" id="status-lastrun"></div>
+    <div class="tier-legend">
+      <div class="tier-legend-item">🟢 <strong>No action</strong> — nothing notable yet on this listing.</div>
+      <div class="tier-legend-item">🟠 <strong>Worth reviewing</strong> — a second price reduction, a cumulative drop of 7% or more, or 45+ days tracked with one cut.</div>
+      <div class="tier-legend-item">🔴 <strong>Strong signal</strong> — 90+ days tracked with three or more reductions and a cumulative drop of 15% or more, or several signals stacking together.</div>
+    </div>
+  </div>
 </div>
 
 <main>
@@ -311,6 +392,7 @@
         region: watchlistById[l.watchlist_id]?.region || "—"
       }));
 
+      renderStatus();
       render();
     } catch (err) {
       document.getElementById("content").innerHTML =
@@ -434,6 +516,46 @@
       alert("Couldn't dismiss this alert: " + err.message);
     }
   }
+
+  const REGION_ORDER = ["Cote d'Azur", "Alpes", "Costa del Sol", "Geneve"];
+  const REGION_LABEL = { "Cote d'Azur": "Côte d'Azur", "Alpes": "Alpes", "Costa del Sol": "Costa del Sol", "Geneve": "Genève" };
+
+  function renderStatus() {
+    const total = allListings.length;
+    const counts = {};
+    allListings.forEach(l => { counts[l.region] = (counts[l.region] || 0) + 1; });
+
+    const firstSeenDates = allListings.map(l => l.first_seen).filter(Boolean).map(d => new Date(d));
+    const earliest = firstSeenDates.length ? new Date(Math.min(...firstSeenDates)) : null;
+    const daysTracking = earliest ? Math.max(1, Math.round((Date.now() - earliest.getTime()) / 86400000)) : 0;
+
+    const lastCheckedDates = allListings.map(l => l.last_checked).filter(Boolean).map(d => new Date(d));
+    const lastRun = lastCheckedDates.length ? new Date(Math.max(...lastCheckedDates)) : null;
+
+    const withDrop = allListings.filter(l => l.price_dropped_at).length;
+
+    const statsHtml = `
+      <div class="status-stat"><div class="num">${total}</div><div class="lbl">Listings</div></div>
+      <div class="status-stat"><div class="num">${daysTracking}</div><div class="lbl">Day${daysTracking === 1 ? "" : "s"} tracked</div></div>
+      <div class="status-stat"><div class="num">${withDrop}</div><div class="lbl">With a drop</div></div>
+      ${REGION_ORDER.map(r => `<div class="status-stat"><div class="num">${counts[r] || 0}</div><div class="lbl">${REGION_LABEL[r]}</div></div>`).join("")}
+    `;
+    document.getElementById("status-stats").innerHTML = statsHtml;
+
+    document.getElementById("status-note").textContent = withDrop === 0
+      ? `No price reductions recorded yet — expected this early (tracking started ${earliest ? earliest.toLocaleDateString("fr-FR", { day: "numeric", month: "short" }) : "recently"}). Luxury listings reprice infrequently; alerts below will populate as real patterns emerge.`
+      : `${withDrop} listing${withDrop === 1 ? "" : "s"} with at least one recorded reduction so far.`;
+
+    document.getElementById("status-lastrun").textContent = lastRun
+      ? `Last scrape: ${lastRun.toLocaleDateString("fr-FR", { day: "numeric", month: "short" })} at ${lastRun.toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" })}`
+      : "";
+  }
+
+  document.getElementById("status-toggle").addEventListener("click", () => {
+    const body = document.getElementById("status-body");
+    body.hidden = !body.hidden;
+    document.getElementById("status-toggle").textContent = `Tracking status & alert guide ${body.hidden ? "▾" : "▴"}`;
+  });
 
   document.getElementById("filter-alerts").addEventListener("click", (e) => {
     currentFilter = "alerts";
