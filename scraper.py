@@ -974,6 +974,21 @@ def run(diagnose_id=None):
         sys.exit("Diagnostic mode still needs SUPABASE_URL/KEY to read the watchlist row.")
 
     watchlist = get_watchlist(only_id=diagnose_id)
+
+    # Skip test/throwaway watchlist entries that were never meant to run in
+    # production. id 31 ("Geneve villas 5M+ (LuxuryEstate) - TEST") was left
+    # active by mistake and was generating real alerts on the dashboard.
+    # Also skip anything with "TEST" in the label going forward, so a future
+    # test entry doesn't repeat the same problem silently. Note this filter
+    # only applies to real (non-diagnostic) runs - `--diagnose 31` still
+    # works if you ever want to manually check this entry.
+    EXCLUDED_WATCHLIST_IDS = {31}
+    if not diagnose_id:
+        watchlist = [
+            w for w in watchlist
+            if w["id"] not in EXCLUDED_WATCHLIST_IDS and "test" not in w["label"].lower()
+        ]
+
     alerts_raised = []
 
     for entry in watchlist:
