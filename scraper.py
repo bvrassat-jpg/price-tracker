@@ -40,7 +40,9 @@ import re
 import sys
 import json
 import time
+import random
 import argparse
+import traceback
 from datetime import datetime, timezone
 
 import requests
@@ -55,13 +57,37 @@ HEADERS_SUPABASE = {
     "Content-Type": "application/json",
 }
 
+# A real Chrome sends far more than a User-Agent. A request carrying only
+# UA + Accept-Language is trivially fingerprinted as a script by DataDome /
+# Cloudflare, which is how BellesPierres, JamesEdition and homegate were
+# lost. These are the headers Chrome actually sends on a top-level
+# navigation, in Chrome's order.
 HEADERS_BROWSER = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
+              "image/avif,image/webp,image/apng,*/*;q=0.8",
     "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+    "Connection": "keep-alive",
 }
 
 REQUEST_DELAY_SECONDS = 3  # be polite - one request every few seconds, no concurrency
+
+# Transient failures (a block, a 5xx, a dropped connection) used to kill an
+# entry for the whole day and fire a Slack alert. Retry a couple of times
+# with backoff before believing the source is really down.
+FETCH_ATTEMPTS = 3
+RETRY_BACKOFF_SECONDS = [8, 25]  # wait before attempt 2, then before attempt 3
+RETRYABLE_STATUS = {403, 408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 524}
 
 
 # ---------------------------------------------------------------------------
@@ -721,26 +747,84 @@ def upsert_listing(watchlist_id, source, item):
 SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
 
 
-def notify_slack_source_down(entry, status_code, html):
+def explain_failure(status_code, html, error):
     """
-    Sent when a watchlist entry's FIRST page returns 0 parsed listings on a
-    real (non-diagnostic) run. This is a different signal than "few results
-    this time" - page 1 of an active 5M+ regional search returning nothing
-    at all almost always means the site blocked us or changed its page
-    structure, exactly like BellesPierres/JamesEdition/homegate did. It's
-    a separate Slack message from price-drop alerts on purpose, so a dead
-    source doesn't get lost/ignored the way it did before this session.
+    Turn a failed page-1 fetch into an honest one-line diagnosis.
+
+    The old version scanned the page body for block keywords even when the
+    fetch had raised - in which case the body was always the empty string,
+    so every HTTP error reported "no block keywords found - page structure
+    may have changed". For a 403 that is exactly backwards: the structure
+    is fine, we were blocked. Lead with the status code, which is the
+    strongest evidence available.
     """
-    if not SLACK_WEBHOOK_URL:
+    if status_code in (403, 429):
+        return ("blocked by the site (the request signature or the runner IP is "
+                "being rejected) - this is not a parser problem")
+    if status_code and 500 <= status_code < 600:
+        return "the site returned a server error - usually temporary"
+    if not status_code:
+        return f"could not connect ({error or 'network error'})"
+    if status_code == 200:
+        lowered = (html or "").lower()
+        found = [s for s in BLOCK_SIGNALS if s in lowered]
+        if found:
+            return f"page loaded but shows block signal(s): {found}"
+        return ("page loaded normally but 0 listings parsed - the page structure "
+                "has probably changed")
+    return f"unexpected HTTP {status_code}"
+
+
+def notify_slack_source_failures(source, failures, total_for_source):
+    """
+    ONE message per source per run, not one per watchlist entry.
+
+    Ten watchlist entries share the luxuryestate source, so a single block
+    used to produce ten identical Slack messages 90 seconds apart. Grouping
+    by source makes the real shape of the incident visible at a glance:
+    "10 of 10 entries failed" is a dead source, "1 of 10" is a blip.
+    """
+    if not SLACK_WEBHOOK_URL or not failures:
         return
-    lowered = html.lower()
-    found_signals = [s for s in BLOCK_SIGNALS if s in lowered]
-    reason = f"possible block signal(s): {found_signals}" if found_signals \
-        else "no block keywords found - page structure may have changed"
+    statuses = sorted({f["status"] for f in failures})
+    status_text = ", ".join(f"HTTP {s}" if s else "no response" for s in statuses)
+    reason = explain_failure(failures[0]["status"], failures[0]["html"], failures[0]["error"])
+
+    if len(failures) == total_for_source:
+        headline = f":warning: *Source may be down* — {source} ({status_text})"
+        detail = ("Its only watchlist entry failed on page 1." if total_for_source == 1
+                  else f"All {total_for_source} watchlist entries failed on page 1.")
+    else:
+        headline = f":warning: *Partial failure* — {source} ({status_text})"
+        detail = f"{len(failures)} of {total_for_source} watchlist entries failed on page 1."
+
+    affected = "\n".join(
+        f"• {f['label']} (id {f['id']})" for f in failures[:10]
+    )
+    if len(failures) > 10:
+        affected += f"\n• ...and {len(failures) - 10} more"
+
     text = (
-        f":warning: *Source may be down* — '{entry['label']}' ({entry['source']})\n"
-        f"Page 1 returned 0 listings (HTTP {status_code}). {reason}.\n"
-        f"Run `python scraper.py --diagnose {entry['id']}` to check what's happening."
+        f"{headline}\n{detail} Retried {FETCH_ATTEMPTS}x with backoff.\n"
+        f"Likely cause: {reason}.\n{affected}\n"
+        f"Run `python scraper.py --diagnose {failures[0]['id']}` to inspect."
+    )
+    try:
+        requests.post(SLACK_WEBHOOK_URL, json={"text": text}, timeout=15)
+    except requests.RequestException as e:
+        print(f"  (Slack notification failed: {e})")
+
+
+def notify_slack_run_errors(errors):
+    """One message listing entries that crashed outright, so a bug in one
+    entry is visible instead of silently taking the whole run down."""
+    if not SLACK_WEBHOOK_URL or not errors:
+        return
+    lines = "\n".join(f"• {label} (id {eid}): {msg}" for eid, label, msg in errors[:10])
+    text = (
+        f":rotating_light: *Scraper error* — {len(errors)} watchlist entr"
+        f"{'y' if len(errors) == 1 else 'ies'} crashed during the run\n{lines}\n"
+        f"The rest of the run completed; see the GitHub Actions log for tracebacks."
     )
     try:
         requests.post(SLACK_WEBHOOK_URL, json={"text": text}, timeout=15)
@@ -935,6 +1019,37 @@ def fetch_page(url):
     return r.text
 
 
+def fetch_with_retry(url, attempts=FETCH_ATTEMPTS):
+    """
+    Fetch a page, retrying transient failures with jittered backoff.
+
+    Returns (status_code, html, error): html is None unless the fetch
+    succeeded, status_code is 0 when we never got a response at all.
+    Connection errors and timeouts are handled here rather than thrown -
+    previously only requests.HTTPError was caught at the call site, so a
+    dropped connection on one page aborted the entire run and every
+    remaining watchlist entry was silently skipped.
+    """
+    status_code, error = 0, None
+    for attempt in range(1, attempts + 1):
+        if attempt > 1:
+            wait = RETRY_BACKOFF_SECONDS[min(attempt - 2, len(RETRY_BACKOFF_SECONDS) - 1)]
+            wait += random.uniform(0, 3)  # jitter, so 10 entries don't retry in lockstep
+            print(f"    attempt {attempt - 1} failed ({error}); retrying in {wait:.0f}s")
+            time.sleep(wait)
+        try:
+            r = requests.get(url, headers=HEADERS_BROWSER, timeout=30)
+            status_code = r.status_code
+            if r.status_code == 200:
+                return status_code, r.text, None
+            error = f"HTTP {r.status_code}"
+            if r.status_code not in RETRYABLE_STATUS:
+                break  # 404 and friends won't fix themselves
+        except requests.RequestException as e:
+            status_code, error = 0, type(e).__name__
+    return status_code, None, error
+
+
 BLOCK_SIGNALS = [
     "captcha", "are you a robot", "access denied", "attention required",
     "unusual traffic", "cloudflare", "datadome", "please verify",
@@ -990,6 +1105,15 @@ def run(diagnose_id=None):
         ]
 
     alerts_raised = []
+    # Page-1 failures are collected per source and reported in a single
+    # Slack message at the end of the run, instead of one message per
+    # watchlist entry. Crashes are collected the same way.
+    failures_by_source = {}
+    entries_per_source = {}
+    run_errors = []
+
+    for entry in watchlist:
+        entries_per_source[entry["source"]] = entries_per_source.get(entry["source"], 0) + 1
 
     for entry in watchlist:
         source = entry["source"]
@@ -1003,55 +1127,78 @@ def run(diagnose_id=None):
 
         print(f"\n=== {entry['label']} ({source}, min {min_price:,.0f}) ===")
 
-        all_listings = []
-        for page in range(1, max_pages + 1):
-            page_url = paginate_url(entry["search_url"], page, source)
-            try:
-                resp = requests.get(page_url, headers=HEADERS_BROWSER, timeout=30)
-                status_code = resp.status_code
-                resp.raise_for_status()
-                html = resp.text
-            except requests.HTTPError as e:
-                print(f"  page {page}: request failed ({e}), stopping pagination for this entry")
-                if not diagnose_id and page == 1:
-                    status_code = e.response.status_code if e.response is not None else 0
-                    print(f"  ALERT: page 1 request failed on a real run - notifying Slack")
-                    notify_slack_source_down(entry, status_code, "")
-                break
-            listings = parser(html)
-            if not listings:
-                print(f"  page {page}: 0 listings parsed, stopping pagination")
-                if diagnose_id:
-                    diagnose_empty_page(html, status_code)
-                elif page == 1:
-                    # Page 1 empty on a real run is the strong "source is
-                    # probably dead" signal - alert distinctly from price drops
-                    print(f"  ALERT: page 1 empty on a real run - notifying Slack")
-                    notify_slack_source_down(entry, status_code, html)
-                break
-            print(f"  page {page}: {len(listings)} listings parsed")
-            all_listings.extend(listings)
-            time.sleep(REQUEST_DELAY_SECONDS)
+        # One entry blowing up must never take the rest of the run with it.
+        # A crashed run sends nothing at all, which looks exactly like a
+        # quiet day in Slack - the worst possible failure mode for a
+        # monitoring tool.
+        try:
+            all_listings = []
+            for page in range(1, max_pages + 1):
+                page_url = paginate_url(entry["search_url"], page, source)
+                status_code, html, error = fetch_with_retry(page_url)
 
-        # Apply the price floor
-        qualifying = [l for l in all_listings if l["price"] is not None and l["price"] >= min_price]
-        print(f"Total: {len(all_listings)} parsed, {len(qualifying)} at/above {min_price:,.0f}")
+                if html is None:
+                    print(f"  page {page}: fetch failed after {FETCH_ATTEMPTS} attempts "
+                          f"({error}), stopping pagination for this entry")
+                    if not diagnose_id and page == 1:
+                        failures_by_source.setdefault(source, []).append({
+                            "id": entry["id"], "label": entry["label"],
+                            "status": status_code, "html": "", "error": error,
+                        })
+                    elif diagnose_id and page == 1:
+                        print(f"    {explain_failure(status_code, '', error)}")
+                    break
 
-        if diagnose_id:
-            for item in qualifying[:15]:
-                print(json.dumps(item, indent=2, ensure_ascii=False))
-            continue  # don't write to DB in diagnostic mode
+                listings = parser(html)
+                if not listings:
+                    print(f"  page {page}: 0 listings parsed, stopping pagination")
+                    if diagnose_id:
+                        diagnose_empty_page(html, status_code)
+                    elif page == 1:
+                        # Page 1 empty on a real run is the strong "source is
+                        # probably dead" signal - alert distinctly from price drops
+                        failures_by_source.setdefault(source, []).append({
+                            "id": entry["id"], "label": entry["label"],
+                            "status": status_code, "html": html, "error": None,
+                        })
+                    break
+                print(f"  page {page}: {len(listings)} listings parsed")
+                all_listings.extend(listings)
+                time.sleep(REQUEST_DELAY_SECONDS)
 
-        for item in qualifying:
-            listing_id, previous_price, is_new = upsert_listing(entry["id"], source, item)
-            log_price_history(listing_id, item["price"])
-            alert_state = get_listing_alert_state(listing_id)
-            alert = compute_alert(alert_state.get("first_seen"), get_price_history(listing_id))
-            if apply_alert(listing_id, alert_state, alert, item):
-                alerts_raised.append(item)
+            # Apply the price floor
+            qualifying = [l for l in all_listings if l["price"] is not None and l["price"] >= min_price]
+            print(f"Total: {len(all_listings)} parsed, {len(qualifying)} at/above {min_price:,.0f}")
+
+            if diagnose_id:
+                for item in qualifying[:15]:
+                    print(json.dumps(item, indent=2, ensure_ascii=False))
+                continue  # don't write to DB in diagnostic mode
+
+            for item in qualifying:
+                listing_id, previous_price, is_new = upsert_listing(entry["id"], source, item)
+                log_price_history(listing_id, item["price"])
+                alert_state = get_listing_alert_state(listing_id)
+                alert = compute_alert(alert_state.get("first_seen"), get_price_history(listing_id))
+                if apply_alert(listing_id, alert_state, alert, item):
+                    alerts_raised.append(item)
+
+        except Exception as e:  # noqa: BLE001 - deliberate catch-all, see comment above
+            print(f"  ERROR on '{entry['label']}' (id {entry['id']}): {e!r}")
+            traceback.print_exc()
+            run_errors.append((entry["id"], entry["label"], f"{type(e).__name__}: {e}"))
+            continue
 
     if not diagnose_id:
+        for source, failures in failures_by_source.items():
+            print(f"\nALERT: {len(failures)}/{entries_per_source.get(source, len(failures))} "
+                  f"entries failed for source '{source}' - notifying Slack")
+            notify_slack_source_failures(source, failures, entries_per_source.get(source, len(failures)))
+        notify_slack_run_errors(run_errors)
         print(f"\n{len(alerts_raised)} new/escalated alert(s) raised across all watchlist entries.")
+        if run_errors:
+            print(f"{len(run_errors)} watchlist entr"
+                  f"{'y' if len(run_errors) == 1 else 'ies'} crashed - see tracebacks above.")
 
 
 if __name__ == "__main__":
