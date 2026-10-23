@@ -844,14 +844,12 @@ def run(diagnose_id=None):
 
     watchlist = get_watchlist(only_id=diagnose_id)
 
-    # Skip test/throwaway watchlist entries that were never meant to run in
-    # production. id 31 ("Geneve villas 5M+ (LuxuryEstate) - TEST") was left
-    # active by mistake and was generating real alerts on the dashboard.
-    # Also skip anything with "TEST" in the label going forward, so a future
-    # test entry doesn't repeat the same problem silently. Note this filter
-    # only applies to real (non-diagnostic) runs - `--diagnose 31` still
-    # works if you ever want to manually check this entry.
-    EXCLUDED_WATCHLIST_IDS = {31}
+    # Skip test/throwaway watchlist entries: anything with "TEST" in its
+    # label, plus any id listed below. id 31 (Geneva on LuxuryEstate) used to
+    # be excluded here; since Oct 2026 it is Geneva's main source and
+    # RealAdvisor (id 16) is deactivated. The filter only applies to real
+    # runs, `--diagnose <id>` still works on any entry.
+    EXCLUDED_WATCHLIST_IDS = set()
     if not diagnose_id:
         watchlist = [
             w for w in watchlist
