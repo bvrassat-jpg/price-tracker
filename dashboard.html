@@ -363,6 +363,24 @@
     margin-right: 6px;
     font-family: var(--font-body);
   }
+  .mkt-region { margin-bottom: 18px; }
+  .mkt-region h2 {
+    font-family: var(--font-display); font-weight: 600; font-size: 20px; margin: 8px 2px 8px;
+  }
+  .mkt-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
+  @media (min-width: 560px) { .mkt-grid { grid-template-columns: repeat(4, 1fr); } }
+  .mkt-cell { background: var(--ink-card); border: 1px solid var(--line); border-radius: 8px; padding: 10px; }
+  .mkt-cell .num { font-family: var(--font-display); font-size: 20px; color: var(--brass-bright); line-height: 1.2; }
+  .mkt-cell .lbl { font-size: 10px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.04em; margin-top: 2px; }
+  .mkt-zones { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 12px; }
+  .mkt-zones th { text-align: right; font-weight: 500; color: var(--text-dim); font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; padding: 6px 4px; border-bottom: 1px solid var(--line); }
+  .mkt-zones th:first-child, .mkt-zones td:first-child { text-align: left; }
+  .mkt-zones td { text-align: right; padding: 6px 4px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  .mkt-zones td:first-child { white-space: normal; }
+  .mkt-zones tr.thin td { color: var(--text-dim); }
+  .mkt-note { font-size: 12px; color: var(--text-dim); line-height: 1.6; margin: 4px 2px 16px; }
+  .zone-scroll { overflow-x: auto; }
+  .also { font-size: 12px; color: var(--text-dim); margin-top: 6px; }
 </style>
 </head>
 <body>
@@ -381,12 +399,13 @@
     <option value="Geneve">Genève</option>
     <option value="Costa del Sol">Costa del Sol</option>
   </select>
-  <button id="view-activity" class="active" data-view="activity">Activity</button>
-  <button id="view-alerts" data-view="alerts">Alerts</button>
-  <button id="view-all" data-view="all">All properties</button>
+  <button data-view="activity" class="active">Activity</button>
+  <button data-view="alerts">Alerts</button>
+  <button data-view="all">All properties</button>
+  <button data-view="market">Market</button>
   <select id="kind-select">
     <option value="cuts">Price cuts</option>
-    <option value="cuts+gone">Price cuts + no longer online</option>
+    <option value="cuts+gone">Price cuts + removed</option>
     <option value="all">Everything (incl. new listings)</option>
   </select>
   <select id="sort-select" hidden>
@@ -406,7 +425,7 @@
     <div class="status-note" id="status-note"></div>
     <div class="status-lastrun" id="status-lastrun"></div>
     <div class="tier-legend">
-      <div class="tier-legend-item">Each zone is scanned one day in three, so a listing's information can be up to three days old.</div>
+      <div class="tier-legend-item">Each zone is scanned one day in three. The same property listed by several agencies is counted once.</div>
       <div class="tier-legend-item"><strong>Points per listing:</strong> 180+ days on market +1 (365+ days +3), 2 or 3 price reductions +1 (4 or more +3), cumulative drop of 7% or more +1 (15% or more +3).</div>
       <div class="tier-legend-item">🟠 <strong>Worth reviewing</strong>: 2 points or more.</div>
       <div class="tier-legend-item">🔴 <strong>Strong signal</strong>: 5 points or more.</div>
@@ -425,40 +444,27 @@
   const AUTH = { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${SUPABASE_ANON_KEY}` };
 
   const DAY_MS = 86400000;
-  // A listing not seen for this long is shown as "no longer on the portal".
-  // Zones are scanned one day in three, so anything under ~a week is normal.
-  const STALE_MS = 8 * DAY_MS;
+  // Seen within this window = currently on the market. Zones are scanned
+  // one day in three, so a week leaves room for a missed run.
+  const LIVE_MS = 8 * DAY_MS;
   const ACTIVITY_DAYS = 60;
+  const MIN_SAMPLE = 20;   // below this, market figures are shown greyed out
   const SEEN_KEY = "pt_seen_until";
 
-  let allListings = [];
-  let listingById = {};
-  let dropsByListing = {};
+  let allListings = [], listingById = {}, dropsByListing = {}, watchlistById = {};
+  let groups = [], groupOf = {};
   let events = [];
-  let currentView = "activity";
-  let currentRegion = "";
-  let currentSort = "activity";
-  let currentKinds = "cuts";
-  const KIND_SETS = {
-    "cuts": ["drop", "zone"],
-    "cuts+gone": ["drop", "zone", "gone"],
-    "all": ["drop", "zone", "gone", "new"],
-  };
+  let currentView = "activity", currentRegion = "", currentSort = "activity", currentKinds = "cuts";
+  const KIND_SETS = { "cuts": ["drop", "zone"], "cuts+gone": ["drop", "zone", "gone"], "all": ["drop", "zone", "gone", "new"] };
 
-  function getSeenUntil() {
-    try { return Number(localStorage.getItem(SEEN_KEY)) || 0; } catch (e) { return 0; }
-  }
-  function setSeenUntil(ts) {
-    try { localStorage.setItem(SEEN_KEY, String(ts)); } catch (e) { /* private mode */ }
-  }
+  function getSeenUntil() { try { return Number(localStorage.getItem(SEEN_KEY)) || 0; } catch (e) { return 0; } }
+  function setSeenUntil(ts) { try { localStorage.setItem(SEEN_KEY, String(ts)); } catch (e) { /* private mode */ } }
+  const t = d => d ? new Date(d).getTime() : 0;
 
   async function fetchAll(path) {
-    // Supabase returns at most 1000 rows per request: page through.
     const out = [];
     for (let from = 0; ; from += 1000) {
-      const res = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
-        headers: { ...AUTH, Range: `${from}-${from + 999}` }
-      });
+      const res = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, { headers: { ...AUTH, Range: `${from}-${from + 999}` } });
       if (!res.ok) throw new Error(`Supabase error ${res.status} on ${path.split("?")[0]}`);
       const rows = await res.json();
       out.push(...rows);
@@ -470,245 +476,296 @@
     try {
       const [listings, watchlist, drops] = await Promise.all([
         fetchAll("pt_listings?select=*&order=id.asc"),
-        fetchAll("pt_watchlist?select=id,label,region,active,created_at"),
-        fetchAll("pt_price_drops?select=listing_id,checked_at,price,prev_price,pct&order=checked_at.asc")
-          .catch(() => []),  // view not created yet: the page still works without it
+        fetchAll("pt_watchlist?select=*"),
+        fetchAll("pt_price_drops?select=listing_id,checked_at,price,prev_price,pct&order=checked_at.asc").catch(() => []),
       ]);
-      const watchlistById = Object.fromEntries(watchlist.map(w => [w.id, w]));
-
-      // Only listings from zones that are still scanned: a deactivated
-      // zone's listings would otherwise look like they all vanished.
+      watchlistById = Object.fromEntries(watchlist.map(w => [w.id, w]));
       allListings = listings
         .filter(l => watchlistById[l.watchlist_id]?.active)
-        .map(l => ({ ...l, region: watchlistById[l.watchlist_id]?.region || "—", zone: watchlistById[l.watchlist_id]?.label || "" }));
+        .map(l => ({ ...l, region: watchlistById[l.watchlist_id].region, zone: watchlistById[l.watchlist_id].label }));
       listingById = Object.fromEntries(allListings.map(l => [l.id, l]));
-
       dropsByListing = {};
-      drops.forEach(d => {
-        if (!listingById[d.listing_id]) return;
-        (dropsByListing[d.listing_id] = dropsByListing[d.listing_id] || []).push(d);
-      });
-
-      buildEvents(watchlist);
+      drops.forEach(d => { if (listingById[d.listing_id]) (dropsByListing[d.listing_id] = dropsByListing[d.listing_id] || []).push(d); });
+      buildGroups();
+      buildEvents();
       renderStatus();
       render();
     } catch (err) {
-      document.getElementById("content").innerHTML =
-        `<div class="error">Couldn't load data: ${err.message}.</div>`;
+      document.getElementById("content").innerHTML = `<div class="error">Couldn't load data: ${err.message}.</div>`;
     }
   }
 
-  function buildEvents(watchlist) {
+  // ---- Same property listed by several agencies -------------------------
+  // Two listings are the same property when they are in the same region,
+  // were first seen at the same price, have the same surface (price / price
+  // per m²), and share either the town or the agency. Deliberately
+  // conservative: a missed duplicate is better than merging two villas.
+  function firstPrice(l) {
+    const d = dropsByListing[l.id];
+    return d && d.length ? d[0].prev_price : l.current_price;
+  }
+  function town(l) { return (l.address || "").split(",")[0].trim().toLowerCase(); }
+  function buildGroups() {
+    const parent = {};
+    const find = x => (parent[x] === x ? x : (parent[x] = find(parent[x])));
+    const union = (a, b) => { parent[find(a)] = find(b); };
+    const byKey = {};
+    allListings.forEach(l => {
+      parent[l.id] = l.id;
+      if (!l.price_per_sqm || !l.current_price) return;
+      const area = Math.round(l.current_price / l.price_per_sqm);
+      const base = `${l.region}|${firstPrice(l)}|${area}`;
+      [`${base}|t:${town(l)}`, l.agency ? `${base}|a:${l.agency.toLowerCase()}` : null].filter(Boolean).forEach(k => {
+        if (byKey[k] !== undefined) union(l.id, byKey[k]); else byKey[k] = l.id;
+      });
+    });
+    const map = {};
+    allListings.forEach(l => { const r = find(l.id); (map[r] = map[r] || []).push(l); });
+    groups = Object.values(map).map((members, i) => {
+      const rep = members.slice().sort((a, b) =>
+        ((dropsByListing[b.id] || []).length - (dropsByListing[a.id] || []).length) || (t(a.first_seen) - t(b.first_seen)))[0];
+      const g = { id: i, members, rep };
+      members.forEach(m => { groupOf[m.id] = g; });
+      return g;
+    });
+  }
+  const groupRemoved = g => g.members.every(m => m.is_delisted);
+  const groupRemovedAt = g => Math.max(...g.members.map(m => t(m.delisted_at)));
+  const groupLastSeen = g => Math.max(...g.members.map(m => t(m.last_seen || m.last_checked)));
+  const groupLive = g => !groupRemoved(g) && Date.now() - groupLastSeen(g) <= LIVE_MS;
+  const groupFirstSeen = g => Math.min(...g.members.map(m => t(m.first_seen)));
+  function groupDrops(g) { return dropsByListing[g.rep.id] || []; }
+  function groupTotalDrop(g) {
+    const fp = firstPrice(g.rep);
+    return fp && g.rep.current_price < fp ? (fp - g.rep.current_price) / fp : 0;
+  }
+  function groupLatestActivity(g) {
+    const d = groupDrops(g);
+    return Math.max(groupFirstSeen(g), d.length ? t(d[d.length - 1].checked_at) : 0);
+  }
+
+  // ---- Activity feed ------------------------------------------------------
+  function buildEvents() {
     events = [];
     const since = Date.now() - ACTIVITY_DAYS * DAY_MS;
-
-    // First time each zone produced listings: one "zone added" event, so the
-    // initial batch of a new zone isn't reported as hundreds of new listings.
     const zoneStart = {};
     allListings.forEach(l => {
-      const t = new Date(l.first_seen).getTime();
-      if (!zoneStart[l.watchlist_id] || t < zoneStart[l.watchlist_id]) zoneStart[l.watchlist_id] = t;
+      const ts = t(l.first_seen);
+      if (!zoneStart[l.watchlist_id] || ts < zoneStart[l.watchlist_id]) zoneStart[l.watchlist_id] = ts;
     });
-    Object.entries(zoneStart).forEach(([wid, t]) => {
-      if (t < since) return;
-      const w = watchlist.find(x => String(x.id) === wid);
-      const n = allListings.filter(l => String(l.watchlist_id) === wid).length;
-      events.push({ kind: "zone", at: t, label: w ? w.label : "Zone", region: w ? w.region : "", count: n });
+    Object.entries(zoneStart).forEach(([wid, ts]) => {
+      if (ts < since) return;
+      const w = watchlistById[wid];
+      const n = new Set(allListings.filter(l => String(l.watchlist_id) === wid).map(l => groupOf[l.id].id)).size;
+      events.push({ kind: "zone", at: ts, label: w.label, region: w.region, count: n });
     });
-
-    allListings.forEach(l => {
-      const first = new Date(l.first_seen).getTime();
-      if (first >= since && first > zoneStart[l.watchlist_id] + 2 * DAY_MS) {
-        events.push({ kind: "new", at: first, listing: l });
-      }
-      (dropsByListing[l.id] || []).forEach(d => {
-        const t = new Date(d.checked_at).getTime();
-        if (t >= since) events.push({ kind: "drop", at: t, listing: l, drop: d });
-      });
-      const last = new Date(l.last_seen || l.last_checked).getTime();
-      if (Date.now() - last > STALE_MS && last >= since) {
-        events.push({ kind: "gone", at: last, listing: l });
-      }
+    groups.forEach(g => {
+      const first = groupFirstSeen(g);
+      if (first >= since && first > zoneStart[g.rep.watchlist_id] + 2 * DAY_MS) events.push({ kind: "new", at: first, group: g });
+      groupDrops(g).forEach(d => { const ts = t(d.checked_at); if (ts >= since) events.push({ kind: "drop", at: ts, group: g, drop: d }); });
+      if (groupRemoved(g)) { const ts = groupRemovedAt(g); if (ts >= since) events.push({ kind: "gone", at: ts, group: g }); }
     });
     events.sort((a, b) => b.at - a.at);
   }
 
+  // ---- Formatting -----------------------------------------------------------
   function formatPrice(price, currency) {
     if (price === null || price === undefined) return "Price on request";
     if (currency === "CHF") return "CHF " + Math.round(price).toLocaleString("fr-FR");
-    if (currency === "USD") return "$" + Math.round(price).toLocaleString("en-US") + " (USD)";
     return Math.round(price).toLocaleString("fr-FR") + " €";
   }
-  function fmtDate(t, withYear) {
-    if (!t) return "—";
-    return new Date(t).toLocaleDateString("en-GB", withYear
-      ? { day: "numeric", month: "short", year: "numeric" }
-      : { day: "numeric", month: "short" });
+  function fmtDate(ts, withYear) {
+    if (!ts) return "—";
+    return new Date(ts).toLocaleDateString("en-GB", withYear ? { day: "numeric", month: "short", year: "numeric" } : { day: "numeric", month: "short" });
   }
-  function dayHeading(t) {
-    const d = new Date(t); d.setHours(0, 0, 0, 0);
+  function dayHeading(ts) {
+    const d = new Date(ts); d.setHours(0, 0, 0, 0);
     const today = new Date(); today.setHours(0, 0, 0, 0);
     const diff = Math.round((today - d) / DAY_MS);
     if (diff === 0) return "Today";
     if (diff === 1) return "Yesterday";
     return d.toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "long" });
   }
-  function sourceLabel(source) {
-    return { realadvisor: "RealAdvisor", luxuryestate: "LuxuryEstate" }[source] || source;
+  const pct = (x, dec = 0) => (x === null || x === undefined || isNaN(x)) ? "—" : (100 * x).toFixed(dec) + "%";
+  function median(arr) {
+    const a = arr.filter(x => x !== null && x !== undefined && !isNaN(x)).sort((x, y) => x - y);
+    if (!a.length) return null;
+    const m = Math.floor(a.length / 2);
+    return a.length % 2 ? a[m] : (a[m - 1] + a[m]) / 2;
   }
 
   const TIER_RANK = { green: 0, orange: 1, red: 2 };
   const TIER_EMOJI = { orange: "🟠", red: "🔴" };
   const TIER_LABEL = { orange: "Worth reviewing", red: "Strong signal" };
-
   function isActiveAlert(l) {
     const tier = l.alert_tier;
     if (!tier || tier === "green") return false;
     if (l.dismissed_at && TIER_RANK[l.dismissed_tier] >= TIER_RANK[tier]) return false;
     return true;
   }
-  function isStale(l) {
-    return Date.now() - new Date(l.last_seen || l.last_checked).getTime() > STALE_MS;
-  }
-  function lastDrop(l) {
-    const d = dropsByListing[l.id];
-    if (d && d.length) return d[d.length - 1];
-    if (l.price_dropped_at) return { checked_at: l.price_dropped_at, pct: l.price_change_pct };
-    return null;
-  }
-  function firstPrice(l) {
-    const d = dropsByListing[l.id];
-    return d && d.length ? d[0].prev_price : null;
-  }
-  function latestActivity(l) {
-    const d = lastDrop(l);
-    return Math.max(new Date(l.first_seen).getTime(), d ? new Date(d.checked_at).getTime() : 0);
-  }
+  const groupAlert = g => g.members.filter(isActiveAlert).sort((a, b) => TIER_RANK[b.alert_tier] - TIER_RANK[a.alert_tier])[0];
 
-  function datesBlock(l) {
-    const parts = [`Tracked since <strong>${fmtDate(l.first_seen, true)}</strong>`];
-    const drops = dropsByListing[l.id] || [];
+  // ---- Cards ----------------------------------------------------------------
+  function datesBlock(g) {
+    const l = g.rep;
+    const parts = [`On the market since at least <strong>${fmtDate(groupFirstSeen(g), true)}</strong>`];
+    const drops = groupDrops(g);
     if (drops.length) {
-      const fp = firstPrice(l);
-      const total = fp ? Math.round(1000 * (fp - l.current_price) / fp) / 10 : null;
-      parts.push(`${drops.length} price cut${drops.length > 1 ? "s" : ""}, last on <strong>${fmtDate(drops[drops.length - 1].checked_at)}</strong>` +
-        (total ? ` (total −${total}%)` : ""));
-    } else if (l.price_dropped_at) {
-      parts.push(`Last price cut on <strong>${fmtDate(l.price_dropped_at)}</strong>`);
+      const total = groupTotalDrop(g);
+      parts.push(`${drops.length} price cut${drops.length > 1 ? "s" : ""}, last on <strong>${fmtDate(t(drops[drops.length - 1].checked_at))}</strong>` +
+        (total ? ` (total −${pct(total, 1)})` : ""));
     }
-    if (isStale(l)) {
-      parts.push(`Not seen on the portal since <strong>${fmtDate(l.last_seen || l.last_checked)}</strong>`);
-    }
+    if (groupRemoved(g)) parts.push(`Removed from the portal on <strong>${fmtDate(groupRemovedAt(g))}</strong>`);
+    else if (Date.now() - groupLastSeen(g) > LIVE_MS) parts.push(`Last seen <strong>${fmtDate(groupLastSeen(g))}</strong> (this zone is only partly scanned)`);
     return `<div class="dates">${parts.join("<br>")}</div>`;
   }
-
   function alertBlock(l) {
-    if (!isActiveAlert(l)) return "";
+    if (!l || !isActiveAlert(l)) return "";
     const reasons = (l.alert_reasons || "").split("\n").filter(Boolean);
     return `<div class="drop-badge tier-${l.alert_tier}">${TIER_EMOJI[l.alert_tier] || ""} ${TIER_LABEL[l.alert_tier] || ""}
       <ul class="reasons">${reasons.map(r => `<li>${r}</li>`).join("")}</ul>
-      <button class="dismiss-btn" onclick="dismissAlert(${l.id})" title="Hide until this listing gets worse">Dismiss</button>
-    </div>`;
+      <button class="dismiss-btn" onclick="dismissGroup(${groupOf[l.id].id})" title="Hide until this listing gets worse">Dismiss</button></div>`;
   }
-
-  function listingCard(l, opts = {}) {
-    const agency = l.agency
-      ? `<div class="agency"><span class="label">Agency</span> ${l.agency}</div>` : "";
+  function groupCard(g, opts = {}) {
+    const l = g.rep;
+    const agencies = [...new Set(g.members.map(m => m.agency).filter(Boolean))];
+    const also = agencies.length > 1 ? `<div class="also">Listed by ${agencies.length} agencies: ${agencies.join(", ")}</div>`
+      : (agencies.length ? `<div class="agency"><span class="label">Agency</span> ${agencies[0]}</div>` : "");
     const oldPrice = opts.prevPrice ? `<span class="price-old">${formatPrice(opts.prevPrice, l.currency)}</span>` : "";
-    return `
-      <div class="card ${opts.unseen ? "unseen" : ""} ${isStale(l) ? "stale" : ""}" id="card-${l.id}">
+    const stale = groupRemoved(g) || Date.now() - groupLastSeen(g) > LIVE_MS;
+    return `<div class="card ${opts.unseen ? "unseen" : ""} ${stale ? "stale" : ""}">
         ${opts.kind || ""}
         <div class="addr">${l.address || "Address unknown"}</div>
-        <div class="meta">${l.title || ""} · ${l.region} · ${sourceLabel(l.source)}</div>
+        <div class="meta">${l.title || ""} · ${l.region}</div>
         <div class="price-row"><div class="price">${oldPrice}${formatPrice(l.current_price, l.currency)}</div></div>
-        ${alertBlock(l)}
-        ${datesBlock(l)}
-        ${agency}
-        <div class="footer-row"><span class="checked"></span>
-          <a class="view-link" href="${l.url}" target="_blank" rel="noopener">View listing ↗</a></div>
+        ${alertBlock(groupAlert(g))}
+        ${datesBlock(g)}
+        ${also}
+        <div class="footer-row"><span class="checked"></span><a class="view-link" href="${l.url}" target="_blank" rel="noopener">View listing ↗</a></div>
       </div>`;
   }
-
   function eventCard(e, unseen) {
     const badge = unseen ? `<span class="unseen-dot">NEW</span>` : "";
-    if (e.kind === "zone") {
-      return `<div class="card ${unseen ? "unseen" : ""}"><div class="event-kind zone">Zone added${badge}</div>
-        <div class="addr">${e.label}</div>
-        <div class="meta">${e.count} listings now tracked</div></div>`;
-    }
-    const l = e.listing;
-    if (e.kind === "drop") {
-      return listingCard(l, { unseen, prevPrice: e.drop.prev_price,
-        kind: `<div class="event-kind drop">Price cut −${e.drop.pct}%${badge}</div>` });
-    }
-    if (e.kind === "new") {
-      return listingCard(l, { unseen, kind: `<div class="event-kind new">New listing${badge}</div>` });
-    }
-    return listingCard(l, { unseen, kind: `<div class="event-kind gone">No longer on the portal${badge}</div>` });
+    if (e.kind === "zone") return `<div class="card ${unseen ? "unseen" : ""}"><div class="event-kind zone">Zone added${badge}</div>
+        <div class="addr">${e.label}</div><div class="meta">${e.count} properties now tracked</div></div>`;
+    if (e.kind === "drop") return groupCard(e.group, { unseen, prevPrice: e.drop.prev_price, kind: `<div class="event-kind drop">Price cut −${e.drop.pct}%${badge}</div>` });
+    if (e.kind === "new") return groupCard(e.group, { unseen, kind: `<div class="event-kind new">New listing${badge}</div>` });
+    return groupCard(e.group, { unseen, kind: `<div class="event-kind gone">Removed from the portal${badge}</div>` });
   }
 
+  // ---- Market -----------------------------------------------------------------
+  function marketStats(gs, zoneIds) {
+    const live = gs.filter(groupLive);
+    const n = live.length;
+    const now = Date.now();
+    const cutEver = live.filter(g => groupDrops(g).length).length;
+    const cut30 = live.filter(g => groupDrops(g).some(d => now - t(d.checked_at) <= 30 * DAY_MS)).length;
+    const cutSizes = [];
+    live.forEach(g => groupDrops(g).forEach(d => cutSizes.push(d.pct / 100)));
+    const totals = live.filter(g => groupDrops(g).length).map(groupTotalDrop);
+    const ppsqm = median(live.filter(g => g.rep.currency !== "CHF").map(g => g.rep.price_per_sqm));
+    const price = median(live.map(g => g.rep.current_price));
+    const days = median(live.map(g => (now - groupFirstSeen(g)) / DAY_MS));
+    const completeZones = zoneIds.filter(id => watchlistById[id]?.last_complete_scan_at);
+    const removed30 = completeZones.length
+      ? gs.filter(g => groupRemoved(g) && completeZones.includes(g.rep.watchlist_id) && now - groupRemovedAt(g) <= 30 * DAY_MS).length
+      : null;
+    return { n, cutEver: n ? cutEver / n : null, cut30: n ? cut30 / n : null, medCut: median(cutSizes), medTotal: median(totals),
+      ppsqm, price, days, removed30, completeZones: completeZones.length, zones: zoneIds.length };
+  }
+  const eur = v => v === null ? "—" : Math.round(v).toLocaleString("fr-FR") + " €";
+  const meur = v => v === null ? "—" : (v / 1e6).toFixed(1).replace(".", ",") + " M€";
+
+  function renderMarket() {
+    const regions = ["Cote d'Azur", "Costa del Sol", "Alpes", "Geneve"].filter(r => !currentRegion || r === currentRegion);
+    const earliest = Math.min(...allListings.map(l => t(l.first_seen)));
+    let html = `<div class="mkt-note">Asking prices on LuxuryEstate, properties at €5M and above, each property counted once even when several agencies list it.
+      Tracking since ${fmtDate(earliest, true)}. "On the market" durations start at the first day a property was tracked, so they are minimums.
+      Removals are only counted in zones whose last scan read every results page.</div>`;
+    regions.forEach(r => {
+      const gs = groups.filter(g => g.rep.region === r);
+      const zoneIds = Object.values(watchlistById).filter(w => w.active && w.region === r).map(w => w.id);
+      const s = marketStats(gs, zoneIds);
+      const thin = s.n < MIN_SAMPLE;
+      html += `<div class="mkt-region"><h2>${{ "Cote d'Azur": "Côte d'Azur", "Geneve": "Genève" }[r] || r}</h2>
+        <div class="mkt-grid" style="${thin ? "opacity:.55" : ""}">
+          <div class="mkt-cell"><div class="num">${s.n}</div><div class="lbl">Properties on the market</div></div>
+          <div class="mkt-cell"><div class="num">${pct(s.cutEver)}</div><div class="lbl">Cut their price since tracking began</div></div>
+          <div class="mkt-cell"><div class="num">${pct(s.cut30)}</div><div class="lbl">Cut in the last 30 days</div></div>
+          <div class="mkt-cell"><div class="num">${s.medCut === null ? "—" : "−" + pct(s.medCut, 1)}</div><div class="lbl">Typical cut (median)</div></div>
+          <div class="mkt-cell"><div class="num">${s.medTotal === null ? "—" : "−" + pct(s.medTotal, 1)}</div><div class="lbl">Typical total drop, cut properties</div></div>
+          <div class="mkt-cell"><div class="num">${meur(s.price)}</div><div class="lbl">Median asking price</div></div>
+          <div class="mkt-cell"><div class="num">${eur(s.ppsqm)}</div><div class="lbl">Median asking price per m²</div></div>
+          <div class="mkt-cell"><div class="num">${s.removed30 === null ? "—" : s.removed30}</div><div class="lbl">Removed, last 30 days (${s.completeZones}/${s.zones} zones fully scanned)</div></div>
+        </div>
+        <div class="zone-scroll"><table class="mkt-zones"><thead><tr><th>Zone</th><th>Properties</th><th>Cut ever</th><th>Cut 30d</th><th>Typical cut</th><th>€/m²</th></tr></thead><tbody>
+        ${zoneIds.map(id => {
+          const zs = marketStats(gs.filter(g => g.rep.watchlist_id === id), [id]);
+          const name = watchlistById[id].label.replace(/ (villas|chalets|homes)? ?5M\+ \(LuxuryEstate\)/i, "").replace(/ 5M\+.*$/, "");
+          return `<tr class="${zs.n < MIN_SAMPLE ? "thin" : ""}"><td>${name}</td><td>${zs.n}</td><td>${pct(zs.cutEver)}</td><td>${pct(zs.cut30)}</td><td>${zs.medCut === null ? "—" : "−" + pct(zs.medCut, 1)}</td><td>${eur(zs.ppsqm)}</td></tr>`;
+        }).join("")}
+        </tbody></table></div></div>`;
+    });
+    html += `<div class="mkt-note">Greyed figures rest on fewer than ${MIN_SAMPLE} properties: read them as indications only.</div>`;
+    return html;
+  }
+
+  // ---- Render -----------------------------------------------------------------
   function render() {
     const seenUntil = getSeenUntil();
     const content = document.getElementById("content");
-    const inRegion = x => !currentRegion || x === currentRegion;
-    let html = "";
-    let n = 0;
+    const inRegion = r => !currentRegion || r === currentRegion;
+    const count = document.getElementById("result-count");
 
+    if (currentView === "market") {
+      count.textContent = "";
+      content.innerHTML = renderMarket();
+      return;
+    }
     if (currentView === "activity") {
       const kinds = KIND_SETS[currentKinds];
-      const rows = events.filter(e => kinds.includes(e.kind) && inRegion(e.kind === "zone" ? e.region : e.listing.region));
-      n = rows.length;
+      const rows = events.filter(e => kinds.includes(e.kind) && inRegion(e.kind === "zone" ? e.region : e.group.rep.region));
       const unseenCount = rows.filter(e => e.at > seenUntil).length;
-      document.getElementById("result-count").textContent =
-        `${n} event${n === 1 ? "" : "s"} in the last ${ACTIVITY_DAYS} days` + (unseenCount ? `, ${unseenCount} new since your last visit` : "");
-      let lastDay = "";
+      count.textContent = `${rows.length} event${rows.length === 1 ? "" : "s"} in the last ${ACTIVITY_DAYS} days` + (unseenCount ? `, ${unseenCount} new since your last visit` : "");
+      let html = "", lastDay = "";
       rows.forEach(e => {
         const day = dayHeading(e.at);
         if (day !== lastDay) { html += `<div class="day-head">${day}</div>`; lastDay = day; }
         html += eventCard(e, e.at > seenUntil);
       });
-      content.innerHTML = n ? html : `<div class="empty">Nothing happened in the last ${ACTIVITY_DAYS} days in this region.</div>`;
+      content.innerHTML = rows.length ? html : `<div class="empty">Nothing happened in the last ${ACTIVITY_DAYS} days in this region.</div>`;
       return;
     }
-
-    let rows = allListings.filter(l => inRegion(l.region));
+    let rows = groups.filter(g => inRegion(g.rep.region));
     if (currentView === "alerts") {
-      rows = rows.filter(isActiveAlert)
-        .sort((a, b) => (TIER_RANK[b.alert_tier] - TIER_RANK[a.alert_tier]) || (latestActivity(b) - latestActivity(a)));
+      rows = rows.filter(g => groupAlert(g)).sort((a, b) =>
+        (TIER_RANK[groupAlert(b).alert_tier] - TIER_RANK[groupAlert(a).alert_tier]) || (groupLatestActivity(b) - groupLatestActivity(a)));
     } else {
+      rows = rows.filter(g => !groupRemoved(g));
       const sorters = {
-        activity: (a, b) => latestActivity(b) - latestActivity(a),
-        drop: (a, b) => {
-          const pa = firstPrice(a) ? (firstPrice(a) - a.current_price) / firstPrice(a) : 0;
-          const pb = firstPrice(b) ? (firstPrice(b) - b.current_price) / firstPrice(b) : 0;
-          return pb - pa;
-        },
-        price: (a, b) => (b.current_price || 0) - (a.current_price || 0),
-        since: (a, b) => new Date(a.first_seen) - new Date(b.first_seen),
+        activity: (a, b) => groupLatestActivity(b) - groupLatestActivity(a),
+        drop: (a, b) => groupTotalDrop(b) - groupTotalDrop(a),
+        price: (a, b) => (b.rep.current_price || 0) - (a.rep.current_price || 0),
+        since: (a, b) => groupFirstSeen(a) - groupFirstSeen(b),
       };
-      rows = rows.slice().sort(sorters[currentSort]);
+      rows.sort(sorters[currentSort]);
     }
-    n = rows.length;
-    document.getElementById("result-count").textContent = `${n} ${n === 1 ? "property" : "properties"}`;
-    content.innerHTML = n
-      ? rows.map(l => listingCard(l, { unseen: latestActivity(l) > seenUntil && currentView === "alerts" })).join("")
-      : `<div class="empty">${currentView === "alerts"
-          ? "No open alert. Alerts appear once a listing's history shows a real pattern: repeated cuts, a long time on market, a meaningful cumulative drop."
-          : "No property in this region yet."}</div>`;
+    count.textContent = `${rows.length} ${rows.length === 1 ? "property" : "properties"}`;
+    content.innerHTML = rows.length
+      ? rows.map(g => groupCard(g, { unseen: currentView === "alerts" && groupLatestActivity(g) > seenUntil })).join("")
+      : `<div class="empty">${currentView === "alerts" ? "No open alert. Alerts appear once a listing's history shows a real pattern: repeated cuts, a long time on market, a meaningful cumulative drop." : "No property in this region yet."}</div>`;
   }
 
-  async function dismissAlert(listingId) {
+  async function dismissGroup(groupId) {
+    const g = groups[groupId];
     try {
-      const res = await fetch(`${SUPABASE_URL}/rest/v1/rpc/dismiss_alert`, {
-        method: "POST",
-        headers: { ...AUTH, "Content-Type": "application/json" },
-        body: JSON.stringify({ listing_id: listingId }),
-      });
-      if (!res.ok) throw new Error(`Dismiss failed: ${res.status}`);
-      const item = listingById[listingId];
-      if (item) {
-        item.dismissed_at = new Date().toISOString();
-        item.dismissed_tier = item.alert_tier;
+      for (const m of g.members.filter(isActiveAlert)) {
+        const res = await fetch(`${SUPABASE_URL}/rest/v1/rpc/dismiss_alert`, {
+          method: "POST", headers: { ...AUTH, "Content-Type": "application/json" }, body: JSON.stringify({ listing_id: m.id }),
+        });
+        if (!res.ok) throw new Error(`Dismiss failed: ${res.status}`);
+        m.dismissed_at = new Date().toISOString();
+        m.dismissed_tier = m.alert_tier;
       }
       render();
     } catch (err) {
@@ -716,28 +773,23 @@
     }
   }
 
-  const REGION_ORDER = ["Cote d'Azur", "Alpes", "Costa del Sol", "Geneve"];
-  const REGION_LABEL = { "Cote d'Azur": "Côte d'Azur", "Alpes": "Alpes", "Costa del Sol": "Costa del Sol", "Geneve": "Genève" };
-
   function renderStatus() {
-    const live = allListings.filter(l => !isStale(l));
+    const live = groups.filter(groupLive);
     const counts = {};
-    live.forEach(l => { counts[l.region] = (counts[l.region] || 0) + 1; });
-    const firstSeen = allListings.map(l => new Date(l.first_seen).getTime()).filter(Boolean);
-    const earliest = firstSeen.length ? Math.min(...firstSeen) : null;
-    const daysTracking = earliest ? Math.max(1, Math.round((Date.now() - earliest) / DAY_MS)) : 0;
-    const lastChecked = allListings.map(l => new Date(l.last_checked).getTime()).filter(Boolean);
-    const lastRun = lastChecked.length ? Math.max(...lastChecked) : null;
-    const withDrop = allListings.filter(l => (dropsByListing[l.id] || []).length || l.price_dropped_at).length;
-
+    live.forEach(g => { counts[g.rep.region] = (counts[g.rep.region] || 0) + 1; });
+    const earliest = Math.min(...allListings.map(l => t(l.first_seen)));
+    const daysTracking = Math.max(1, Math.round((Date.now() - earliest) / DAY_MS));
+    const lastRun = Math.max(...allListings.map(l => t(l.last_checked)));
+    const withDrop = live.filter(g => groupDrops(g).length).length;
+    const regions = ["Cote d'Azur", "Alpes", "Costa del Sol", "Geneve"];
+    const label = { "Cote d'Azur": "Côte d'Azur", "Geneve": "Genève" };
     document.getElementById("status-stats").innerHTML = `
-      <div class="status-stat"><div class="num">${live.length}</div><div class="lbl">Live listings</div></div>
+      <div class="status-stat"><div class="num">${live.length}</div><div class="lbl">Properties on the market</div></div>
       <div class="status-stat"><div class="num">${daysTracking}</div><div class="lbl">Days tracked</div></div>
       <div class="status-stat"><div class="num">${withDrop}</div><div class="lbl">With a cut</div></div>
-      ${REGION_ORDER.map(r => `<div class="status-stat"><div class="num">${counts[r] || 0}</div><div class="lbl">${REGION_LABEL[r]}</div></div>`).join("")}`;
+      ${regions.map(r => `<div class="status-stat"><div class="num">${counts[r] || 0}</div><div class="lbl">${label[r] || r}</div></div>`).join("")}`;
     document.getElementById("status-note").textContent =
-      `${withDrop} listing${withDrop === 1 ? "" : "s"} with at least one price cut since tracking started on ${earliest ? fmtDate(earliest, true) : "—"}. ` +
-      `${allListings.length - live.length} listing${allListings.length - live.length === 1 ? "" : "s"} no longer seen on the portals.`;
+      `${allListings.length} listings in the database correspond to ${groups.length} distinct properties (the rest are the same property listed by several agencies).`;
     document.getElementById("status-lastrun").textContent = lastRun
       ? `Last scan: ${fmtDate(lastRun)} at ${new Date(lastRun).toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" })}` : "";
   }
@@ -752,6 +804,7 @@
     document.querySelectorAll("[data-view]").forEach(b => b.classList.toggle("active", b === btn));
     document.getElementById("sort-select").hidden = currentView !== "all";
     document.getElementById("kind-select").hidden = currentView !== "activity";
+    document.getElementById("mark-seen").hidden = currentView === "market" || currentView === "all";
     render();
   }));
   document.getElementById("sort-select").addEventListener("change", e => { currentSort = e.target.value; render(); });
@@ -759,10 +812,7 @@
   document.getElementById("region-select").addEventListener("change", e => { currentRegion = e.target.value; render(); });
   document.getElementById("mark-seen").addEventListener("click", () => { setSeenUntil(Date.now()); render(); });
 
-  if ("serviceWorker" in navigator) {
-    navigator.serviceWorker.register("service-worker.js").catch(() => {});
-  }
-
+  if ("serviceWorker" in navigator) navigator.serviceWorker.register("service-worker.js").catch(() => {});
   loadData();
 </script>
 

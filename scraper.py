@@ -404,6 +404,7 @@ def upsert_listing(watchlist_id, source, item):
             "address": item["address"] or row.get("address"),
             "agency": item["agency"] or row.get("agency"),
             "is_delisted": False,
+            "delisted_at": None,
         }
 
         if previous_price is not None and item["price"] is not None and item["price"] < previous_price:
@@ -533,6 +534,48 @@ def notify_slack_run_errors(errors):
         print(f"  (Slack notification failed: {e})")
 
 
+def mark_delisted(watchlist_id, seen_external_ids, run_started_at):
+    """
+    Called only after a COMPLETE scan of a zone (pagination reached the real
+    end of the results). Listings of that zone that were not on any page this
+    time have left the portal: sold, withdrawn or expired. Zones capped by
+    max_pages never call this, because a listing beyond the cap would be
+    wrongly reported as removed. Listings under the price floor are still in
+    seen_external_ids, so a price cut below the floor is not a removal.
+    """
+    r = requests.get(
+        f"{SUPABASE_URL}/rest/v1/pt_listings?watchlist_id=eq.{watchlist_id}"
+        f"&is_delisted=eq.false&last_seen=lt.{run_started_at}&select=id,external_id",
+        headers=HEADERS_SUPABASE, timeout=30,
+    )
+    r.raise_for_status()
+    gone = [row["id"] for row in r.json() if row["external_id"] not in seen_external_ids]
+    if not gone:
+        return 0
+    now = datetime.now(timezone.utc).isoformat()
+    for i in range(0, len(gone), 100):
+        ids = ",".join(str(x) for x in gone[i:i + 100])
+        requests.patch(
+            f"{SUPABASE_URL}/rest/v1/pt_listings?id=in.({ids})",
+            headers=HEADERS_SUPABASE, json={"is_delisted": True, "delisted_at": now}, timeout=30,
+        ).raise_for_status()
+    return len(gone)
+
+
+def record_scan(watchlist_id, complete, pages_read):
+    now = datetime.now(timezone.utc).isoformat()
+    patch = {"last_scan_at": now, "last_scan_complete": complete, "last_scan_pages": pages_read}
+    if complete:
+        patch["last_complete_scan_at"] = now
+    try:
+        requests.patch(
+            f"{SUPABASE_URL}/rest/v1/pt_watchlist?id=eq.{watchlist_id}",
+            headers=HEADERS_SUPABASE, json=patch, timeout=30,
+        ).raise_for_status()
+    except requests.RequestException as e:
+        print(f"  (could not record scan status: {e})")
+
+
 def watchlist_has_listings(watchlist_id):
     r = requests.get(
         f"{SUPABASE_URL}/rest/v1/pt_listings?watchlist_id=eq.{watchlist_id}&select=id&limit=1",
@@ -562,7 +605,13 @@ def notify_daily_digest(digest, alerts_raised):
     if digest["zones"]:
         lines.append("_" + ", ".join(sorted(digest["zones"])) + "_")
 
-    drops = sorted(digest["drops"], key=lambda d: (d[1] - d[0]["price"]) / d[1], reverse=True)
+    # The same property is often listed by several agencies: one line per
+    # property (same old price, same new price, same surface).
+    unique = {}
+    for item, prev in digest["drops"]:
+        area = round(item["price"] / item["price_per_sqm"]) if item.get("price_per_sqm") else item.get("title")
+        unique.setdefault((prev, item["price"], area), (item, prev))
+    drops = sorted(unique.values(), key=lambda d: (d[1] - d[0]["price"]) / d[1], reverse=True)
     if drops:
         lines.append(f"\n*Price drops ({len(drops)})*")
         for item, prev in drops[:15]:
@@ -576,6 +625,9 @@ def notify_daily_digest(digest, alerts_raised):
 
     for label, n in digest["baselines"]:
         lines.append(f"\n:new: Zone added: *{label}*, {n} listings now tracked")
+
+    if digest["removed"]:
+        lines.append(f"\n{digest['removed']} listing(s) no longer on the portal (sold, withdrawn or expired).")
 
     if alerts_raised:
         lines.append(f"\n{len(alerts_raised)} new or escalated alert(s), see the messages above.")
@@ -865,7 +917,8 @@ def run(diagnose_id=None):
     random.shuffle(watchlist)  # different order every day
 
     # Collected for the daily Slack digest
-    digest = {"zones": [], "new": [], "drops": [], "baselines": []}
+    digest = {"zones": [], "new": [], "drops": [], "baselines": [], "removed": 0}
+    run_started_at = datetime.now(timezone.utc).isoformat()
 
     alerts_raised = []
     # Page-1 failures are collected per source and reported in a single
@@ -898,11 +951,18 @@ def run(diagnose_id=None):
         # monitoring tool.
         try:
             all_listings = []
+            seen_ids = set()
+            complete = False   # True only if pagination reached the real end of the results
+            pages_read = 0
             for page in range(1, max_pages + 1):
                 page_url = paginate_url(entry["search_url"], page, source)
                 status_code, html, error = fetch_with_retry(page_url)
 
                 if html is None:
+                    if page > 1 and status_code == 404:
+                        complete = True  # past the last page of results
+                        print(f"  page {page}: 404, end of results")
+                        break
                     print(f"  page {page}: fetch failed after {FETCH_ATTEMPTS} attempts "
                           f"({error}), stopping pagination for this entry")
                     if not diagnose_id and page == 1:
@@ -915,6 +975,13 @@ def run(diagnose_id=None):
                     break
 
                 listings = parser(html)
+                if listings and page > 1 and all(l["external_id"] in seen_ids for l in listings):
+                    # Some sites serve the last page again past the end
+                    complete = True
+                    print(f"  page {page}: only repeats, end of results")
+                    break
+                if not listings and page > 1:
+                    complete = True
                 if not listings:
                     print(f"  page {page}: 0 listings parsed, stopping pagination")
                     if diagnose_id:
@@ -928,7 +995,9 @@ def run(diagnose_id=None):
                         })
                     break
                 print(f"  page {page}: {len(listings)} listings parsed")
+                pages_read = page
                 all_listings.extend(listings)
+                seen_ids.update(l["external_id"] for l in listings)
                 time.sleep(random.uniform(*REQUEST_DELAY_RANGE))
 
             # Apply the price floor
@@ -959,6 +1028,15 @@ def run(diagnose_id=None):
                 alert = compute_alert(alert_state.get("first_seen"), get_price_history(listing_id))
                 if apply_alert(listing_id, alert_state, alert, item):
                     alerts_raised.append(item)
+
+            if not complete and pages_read >= max_pages:
+                print(f"  capped at {max_pages} pages: removals can't be detected for this zone")
+            if complete:
+                n_gone = mark_delisted(entry["id"], seen_ids, run_started_at)
+                if n_gone:
+                    print(f"  {n_gone} listing(s) no longer on the portal, marked as removed")
+                    digest["removed"] += n_gone
+            record_scan(entry["id"], complete, pages_read)
 
         except Exception as e:  # noqa: BLE001 - deliberate catch-all, see comment above
             print(f"  ERROR on '{entry['label']}' (id {entry['id']}): {e!r}")
