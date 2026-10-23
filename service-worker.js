@@ -1,7 +1,7 @@
 // Service worker: makes the dashboard installable as an app, and receives
 // push messages so a new alert can show a notification and set the red
 // badge on the app icon even when the app is closed.
-const CACHE_NAME = "price-tracker-shell-v2";
+const CACHE_NAME = "price-tracker-shell-v3";
 const SHELL_FILES = ["./dashboard.html", "./manifest.json"];
 
 self.addEventListener("install", (event) => {
@@ -19,7 +19,14 @@ self.addEventListener("activate", (event) => {
 
 self.addEventListener("fetch", (event) => {
   // Network-first: the app is meaningless without live data.
-  event.respondWith(fetch(event.request).catch(() => caches.match(event.request)));
+  // "no-cache" makes the phone check GitHub for a newer version every time,
+  // instead of reusing a copy up to 10 minutes old.
+  const req = event.request;
+  const sameOrigin = new URL(req.url).origin === self.location.origin;
+  event.respondWith(
+    fetch(sameOrigin && req.method === "GET" ? new Request(req, { cache: "no-cache" }) : req)
+      .catch(() => caches.match(req))
+  );
 });
 
 self.addEventListener("push", (event) => {

@@ -381,6 +381,7 @@
   .mkt-note { font-size: 12px; color: var(--text-dim); line-height: 1.6; margin: 4px 2px 16px; }
   .zone-scroll { overflow-x: auto; }
   .also { font-size: 12px; color: var(--text-dim); margin-top: 6px; }
+  .alert-date { font-size: 13px; font-weight: 600; color: var(--paper); margin-top: 6px; }
 </style>
 </head>
 <body>
@@ -639,8 +640,16 @@
   function alertBlock(l) {
     if (!l || !isActiveAlert(l)) return "";
     const reasons = (l.alert_reasons || "").split("\n").filter(Boolean);
-    const raised = l.alert_raised_at ? ` · since ${fmtDate(t(l.alert_raised_at), true)}` : "";
-    return `<div class="drop-badge tier-${l.alert_tier}">${TIER_EMOJI[l.alert_tier] || ""} ${TIER_LABEL[l.alert_tier] || ""}${raised}
+    let raised = "";
+    if (l.alert_raised_at) {
+      const ts = t(l.alert_raised_at);
+      const days = Math.floor((Date.now() - ts) / DAY_MS);
+      const ago = days === 0 ? "today" : days === 1 ? "yesterday" : `${days} days ago`;
+      const isNew = ts > getSeenUntil();
+      raised = `<div class="alert-date">Alert raised on ${fmtDate(ts, true)} (${ago})${isNew ? '<span class="unseen-dot">NEW</span>' : ""}</div>`;
+    }
+    return `<div class="drop-badge tier-${l.alert_tier}">${TIER_EMOJI[l.alert_tier] || ""} ${TIER_LABEL[l.alert_tier] || ""}
+      ${raised}
       <ul class="reasons">${reasons.map(r => `<li>${r}</li>`).join("")}</ul>
       <button class="dismiss-btn" onclick="dismissGroup(${groupOf[l.id].id})" title="Hide until this listing gets worse">Dismiss</button></div>`;
   }
@@ -789,7 +798,7 @@
     content.innerHTML = rows.length
       ? rows.map(g => {
           const unseen = currentView === "alerts" && t(groupAlert(g).alert_raised_at) > seenUntil;
-          return groupCard(g, { unseen, kind: unseen ? `<div class="event-kind drop">New alert<span class="unseen-dot">NEW</span></div>` : "" });
+          return groupCard(g, { unseen });
         }).join("")
       : `<div class="empty">${currentView === "alerts" ? "No open alert. Alerts appear once a listing's history shows a real pattern: repeated cuts, a long time on market, a meaningful cumulative drop." : "No property in this region yet."}</div>`;
   }
