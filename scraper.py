@@ -85,7 +85,17 @@ HEADERS_BROWSER = {
     "Connection": "keep-alive",
 }
 
-REQUEST_DELAY_SECONDS = 3  # be polite - one request every few seconds, no concurrency
+# Pauses are randomised so the traffic doesn't have a machine-regular rhythm:
+# a few seconds between pages, a longer break between two zones.
+REQUEST_DELAY_RANGE = (4, 9)     # seconds between two pages
+ENTRY_PAUSE_RANGE = (15, 45)     # seconds between two watchlist entries
+
+# Rotation: each watchlist entry is scraped one day out of N, so the daily
+# load on the sources is divided by N. Luxury listings rarely reprice, so a
+# drop seen up to N days late changes nothing for the business. A manual run
+# with FULL_RUN=1 scrapes every entry.
+SCRAPE_EVERY_N_DAYS = int(os.environ.get("SCRAPE_EVERY_N_DAYS", "3") or 3)
+FULL_RUN = os.environ.get("FULL_RUN", "").strip().lower() in ("1", "true", "yes")
 
 # Transient failures (a block, a 5xx, a dropped connection) used to kill an
 # entry for the whole day and fire a Slack alert. Retry a couple of times
@@ -523,6 +533,67 @@ def notify_slack_run_errors(errors):
         print(f"  (Slack notification failed: {e})")
 
 
+def watchlist_has_listings(watchlist_id):
+    r = requests.get(
+        f"{SUPABASE_URL}/rest/v1/pt_listings?watchlist_id=eq.{watchlist_id}&select=id&limit=1",
+        headers=HEADERS_SUPABASE, timeout=30,
+    )
+    r.raise_for_status()
+    return bool(r.json())
+
+
+def _fmt_eur(v):
+    return f"{v:,.0f}".replace(",", " ")
+
+
+def notify_daily_digest(digest, alerts_raised):
+    """
+    One Slack message per run, every run, even when nothing happened.
+    It lists every price drop (however small) and every new listing, so the
+    tracker visibly lives day to day, without touching the alert thresholds
+    in compute_alert. It also doubles as a heartbeat: no digest in Slack
+    means the run did not complete.
+    """
+    if not SLACK_WEBHOOK_URL:
+        return
+    day = datetime.now(timezone.utc).strftime("%d %b")
+    lines = [f":bar_chart: *Price Tracker, {day}*: {len(digest['zones'])} zone(s) scanned today"]
+    if digest["zones"]:
+        lines.append("_" + ", ".join(sorted(digest["zones"])) + "_")
+
+    drops = sorted(digest["drops"], key=lambda d: (d[1] - d[0]["price"]) / d[1], reverse=True)
+    if drops:
+        lines.append(f"\n*Price drops ({len(drops)})*")
+        for item, prev in drops[:15]:
+            pct = round(100 * (prev - item["price"]) / prev, 1)
+            lines.append(f"• -{pct}% {item['title'] or 'Property'} ({item['address'] or '?'}): "
+                         f"{_fmt_eur(prev)} \u2192 {_fmt_eur(item['price'])} <{item['url']}|view>")
+        if len(drops) > 15:
+            lines.append(f"• ...and {len(drops) - 15} more on the dashboard")
+    else:
+        lines.append("\nNo price drop today.")
+
+    new = sorted(digest["new"], key=lambda i: i["price"] or 0, reverse=True)
+    if new:
+        lines.append(f"\n*New listings ({len(new)})*")
+        for item in new[:10]:
+            lines.append(f"• {_fmt_eur(item['price'])} {item['title'] or 'Property'} "
+                         f"({item['address'] or '?'}) <{item['url']}|view>")
+        if len(new) > 10:
+            lines.append(f"• ...and {len(new) - 10} more on the dashboard")
+
+    for label, n in digest["baselines"]:
+        lines.append(f"\n:new: Zone added: *{label}*, {n} listings now tracked")
+
+    if alerts_raised:
+        lines.append(f"\n{len(alerts_raised)} new or escalated alert(s), see the messages above.")
+
+    try:
+        requests.post(SLACK_WEBHOOK_URL, json={"text": "\n".join(lines)}, timeout=15)
+    except requests.RequestException as e:
+        print(f"  (Slack digest failed: {e})")
+
+
 def log_price_history(listing_id, price):
     if price is None:
         return
@@ -795,6 +866,17 @@ def run(diagnose_id=None):
             if w["id"] not in EXCLUDED_WATCHLIST_IDS and "test" not in w["label"].lower()
         ]
 
+    # Rotation: today's share of the watchlist only (see SCRAPE_EVERY_N_DAYS).
+    if not diagnose_id and not FULL_RUN and SCRAPE_EVERY_N_DAYS > 1:
+        today_slot = datetime.now(timezone.utc).date().toordinal() % SCRAPE_EVERY_N_DAYS
+        watchlist = [w for w in watchlist if w["id"] % SCRAPE_EVERY_N_DAYS == today_slot]
+        print(f"Rotation 1/{SCRAPE_EVERY_N_DAYS} days: {len(watchlist)} entries today: "
+              + ", ".join(w["label"] for w in watchlist))
+    random.shuffle(watchlist)  # different order every day
+
+    # Collected for the daily Slack digest
+    digest = {"zones": [], "new": [], "drops": [], "baselines": []}
+
     alerts_raised = []
     # Page-1 failures are collected per source and reported in a single
     # Slack message at the end of the run, instead of one message per
@@ -806,7 +888,9 @@ def run(diagnose_id=None):
     for entry in watchlist:
         entries_per_source[entry["source"]] = entries_per_source.get(entry["source"], 0) + 1
 
-    for entry in watchlist:
+    for entry_index, entry in enumerate(watchlist):
+        if entry_index > 0 and not diagnose_id:
+            time.sleep(random.uniform(*ENTRY_PAUSE_RANGE))
         source = entry["source"]
         parser = PARSERS.get(source)
         if parser is None:
@@ -855,7 +939,7 @@ def run(diagnose_id=None):
                     break
                 print(f"  page {page}: {len(listings)} listings parsed")
                 all_listings.extend(listings)
-                time.sleep(REQUEST_DELAY_SECONDS)
+                time.sleep(random.uniform(*REQUEST_DELAY_RANGE))
 
             # Apply the price floor
             qualifying = [l for l in all_listings if l["price"] is not None and l["price"] >= min_price]
@@ -866,8 +950,20 @@ def run(diagnose_id=None):
                     print(json.dumps(item, indent=2, ensure_ascii=False))
                 continue  # don't write to DB in diagnostic mode
 
+            # A zone scraped for the first time would otherwise report every
+            # listing as "new" in the digest. Report it once as a baseline.
+            is_baseline = not watchlist_has_listings(entry["id"])
+            digest["zones"].append(entry["label"])
+            if is_baseline and qualifying:
+                digest["baselines"].append((entry["label"], len(qualifying)))
+
             for item in qualifying:
                 listing_id, previous_price, is_new = upsert_listing(entry["id"], source, item)
+                if is_new and not is_baseline:
+                    digest["new"].append(item)
+                if (previous_price is not None and item["price"] is not None
+                        and item["price"] < previous_price):
+                    digest["drops"].append((item, previous_price))
                 log_price_history(listing_id, item["price"])
                 alert_state = get_listing_alert_state(listing_id)
                 alert = compute_alert(alert_state.get("first_seen"), get_price_history(listing_id))
@@ -886,6 +982,7 @@ def run(diagnose_id=None):
                   f"entries failed for source '{source}' - notifying Slack")
             notify_slack_source_failures(source, failures, entries_per_source.get(source, len(failures)))
         notify_slack_run_errors(run_errors)
+        notify_daily_digest(digest, alerts_raised)
         print(f"\n{len(alerts_raised)} new/escalated alert(s) raised across all watchlist entries.")
         if run_errors:
             print(f"{len(run_errors)} watchlist entr"

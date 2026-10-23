@@ -316,6 +316,53 @@
     main { max-width: 640px; margin: 0 auto; }
     header, .controls, .status-wrap { padding-left: 32px; padding-right: 32px; }
   }
+  .controls .seen-btn { margin-left: auto; }
+  .day-head {
+    font-size: 11px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--brass-bright);
+    margin: 18px 2px 8px;
+  }
+  .day-head:first-child { margin-top: 4px; }
+  .event-kind {
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    margin-bottom: 6px;
+  }
+  .event-kind.drop { color: #e0a878; }
+  .event-kind.new { color: var(--brass-bright); }
+  .event-kind.gone { color: var(--text-dim); }
+  .event-kind.zone { color: var(--paper); }
+  .unseen-dot {
+    display: inline-block;
+    background: var(--brass-bright);
+    color: var(--ink);
+    border-radius: 10px;
+    padding: 1px 7px;
+    font-size: 10px;
+    font-weight: 700;
+    margin-left: 6px;
+    vertical-align: 1px;
+  }
+  .card.unseen { border-color: rgba(201,168,76,0.55); }
+  .card.stale { opacity: 0.6; }
+  .dates {
+    margin-top: 10px;
+    font-size: 12px;
+    color: var(--text-dim);
+    line-height: 1.6;
+  }
+  .dates strong { color: var(--paper); font-weight: 500; }
+  .price-old {
+    font-size: 13px;
+    color: var(--text-dim);
+    text-decoration: line-through;
+    margin-right: 6px;
+    font-family: var(--font-body);
+  }
 </style>
 </head>
 <body>
@@ -323,7 +370,7 @@
 <header>
   <div class="eyebrow">PrimeAuctions</div>
   <h1>Price Tracker</h1>
-  <p>Has anything happened in the market today that suggests an auction opportunity? Alerts appear first; everything else follows by price.</p>
+  <p>Has anything happened in the market that suggests an auction opportunity? The activity feed shows every event, newest first.</p>
 </header>
 
 <div class="controls">
@@ -334,12 +381,16 @@
     <option value="Geneve">Genève</option>
     <option value="Costa del Sol">Costa del Sol</option>
   </select>
-  <button id="filter-alerts" class="active" data-filter="alerts">Alerts only</button>
-  <button id="filter-all" data-filter="all">All properties</button>
-  <select id="tier-threshold">
-    <option value="orange">🟠 Worth reviewing +</option>
-    <option value="red">🔴 Strong signal only</option>
+  <button id="view-activity" class="active" data-view="activity">Activity</button>
+  <button id="view-alerts" data-view="alerts">Alerts</button>
+  <button id="view-all" data-view="all">All properties</button>
+  <select id="sort-select" hidden>
+    <option value="activity">Latest activity first</option>
+    <option value="drop">Biggest drop first</option>
+    <option value="price">Highest price first</option>
+    <option value="since">Longest on market first</option>
   </select>
+  <button id="mark-seen" class="seen-btn" title="Everything currently shown as NEW becomes seen">Mark all as seen</button>
   <div class="count" id="result-count"></div>
 </div>
 
@@ -350,9 +401,11 @@
     <div class="status-note" id="status-note"></div>
     <div class="status-lastrun" id="status-lastrun"></div>
     <div class="tier-legend">
-      <div class="tier-legend-item">🟢 <strong>No action</strong> — nothing notable yet on this listing.</div>
-      <div class="tier-legend-item">🟠 <strong>Worth reviewing</strong> — a second price reduction, a cumulative drop of 7% or more, or 45+ days tracked with one cut.</div>
-      <div class="tier-legend-item">🔴 <strong>Strong signal</strong> — 90+ days tracked with three or more reductions and a cumulative drop of 15% or more, or several signals stacking together.</div>
+      <div class="tier-legend-item">Each zone is scanned one day in three, so a listing's information can be up to three days old.</div>
+      <div class="tier-legend-item"><strong>Points per listing:</strong> 180+ days on market +1 (365+ days +3), 2 or 3 price reductions +1 (4 or more +3), cumulative drop of 7% or more +1 (15% or more +3).</div>
+      <div class="tier-legend-item">🟠 <strong>Worth reviewing</strong>: 2 points or more.</div>
+      <div class="tier-legend-item">🔴 <strong>Strong signal</strong>: 5 points or more.</div>
+      <div class="tier-legend-item"><strong>NEW</strong> marks anything that happened since you last pressed "Mark all as seen" on this device. Dismissing an alert hides it until the listing gets worse.</div>
     </div>
   </div>
 </div>
@@ -364,40 +417,109 @@
 <script>
   const SUPABASE_URL = "https://yagchfkhcndkuzgkdzmv.supabase.co";
   const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InlhZ2NoZmtoY25ka3V6Z2tkem12Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODMxNjk2MjksImV4cCI6MjA5ODc0NTYyOX0.D7zxn8FVCmlbhmFndqqFWWLWZL2mu_lI2RU73NTBTNI";
+  const AUTH = { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${SUPABASE_ANON_KEY}` };
+
+  const DAY_MS = 86400000;
+  // A listing not seen for this long is shown as "no longer on the portal".
+  // Zones are scanned one day in three, so anything under ~a week is normal.
+  const STALE_MS = 8 * DAY_MS;
+  const ACTIVITY_DAYS = 60;
+  const SEEN_KEY = "pt_seen_until";
 
   let allListings = [];
-  let currentFilter = "alerts";
+  let listingById = {};
+  let dropsByListing = {};
+  let events = [];
+  let currentView = "activity";
   let currentRegion = "";
-  let tierThreshold = "orange";
+  let currentSort = "activity";
+
+  function getSeenUntil() {
+    try { return Number(localStorage.getItem(SEEN_KEY)) || 0; } catch (e) { return 0; }
+  }
+  function setSeenUntil(ts) {
+    try { localStorage.setItem(SEEN_KEY, String(ts)); } catch (e) { /* private mode */ }
+  }
+
+  async function fetchAll(path) {
+    // Supabase returns at most 1000 rows per request: page through.
+    const out = [];
+    for (let from = 0; ; from += 1000) {
+      const res = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
+        headers: { ...AUTH, Range: `${from}-${from + 999}` }
+      });
+      if (!res.ok) throw new Error(`Supabase error ${res.status} on ${path.split("?")[0]}`);
+      const rows = await res.json();
+      out.push(...rows);
+      if (rows.length < 1000) return out;
+    }
+  }
 
   async function loadData() {
     try {
-      const [listingsRes, watchlistRes] = await Promise.all([
-        fetch(`${SUPABASE_URL}/rest/v1/pt_listings?select=*&order=alert_score.desc.nullslast,current_price.desc`, {
-          headers: { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${SUPABASE_ANON_KEY}` }
-        }),
-        fetch(`${SUPABASE_URL}/rest/v1/pt_watchlist?select=id,label,region`, {
-          headers: { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${SUPABASE_ANON_KEY}` }
-        })
+      const [listings, watchlist, drops] = await Promise.all([
+        fetchAll("pt_listings?select=*&order=id.asc"),
+        fetchAll("pt_watchlist?select=id,label,region,active,created_at"),
+        fetchAll("pt_price_drops?select=listing_id,checked_at,price,prev_price,pct&order=checked_at.asc")
+          .catch(() => []),  // view not created yet: the page still works without it
       ]);
-
-      if (!listingsRes.ok) throw new Error(`Supabase error: ${listingsRes.status}`);
-
-      const listings = await listingsRes.json();
-      const watchlist = watchlistRes.ok ? await watchlistRes.json() : [];
       const watchlistById = Object.fromEntries(watchlist.map(w => [w.id, w]));
 
-      allListings = listings.map(l => ({
-        ...l,
-        region: watchlistById[l.watchlist_id]?.region || "—"
-      }));
+      // Only listings from zones that are still scanned: a deactivated
+      // zone's listings would otherwise look like they all vanished.
+      allListings = listings
+        .filter(l => watchlistById[l.watchlist_id]?.active)
+        .map(l => ({ ...l, region: watchlistById[l.watchlist_id]?.region || "—", zone: watchlistById[l.watchlist_id]?.label || "" }));
+      listingById = Object.fromEntries(allListings.map(l => [l.id, l]));
 
+      dropsByListing = {};
+      drops.forEach(d => {
+        if (!listingById[d.listing_id]) return;
+        (dropsByListing[d.listing_id] = dropsByListing[d.listing_id] || []).push(d);
+      });
+
+      buildEvents(watchlist);
       renderStatus();
       render();
     } catch (err) {
       document.getElementById("content").innerHTML =
-        `<div class="error">Couldn't load data: ${err.message}. Check the SUPABASE_URL / SUPABASE_ANON_KEY at the top of this file.</div>`;
+        `<div class="error">Couldn't load data: ${err.message}.</div>`;
     }
+  }
+
+  function buildEvents(watchlist) {
+    events = [];
+    const since = Date.now() - ACTIVITY_DAYS * DAY_MS;
+
+    // First time each zone produced listings: one "zone added" event, so the
+    // initial batch of a new zone isn't reported as hundreds of new listings.
+    const zoneStart = {};
+    allListings.forEach(l => {
+      const t = new Date(l.first_seen).getTime();
+      if (!zoneStart[l.watchlist_id] || t < zoneStart[l.watchlist_id]) zoneStart[l.watchlist_id] = t;
+    });
+    Object.entries(zoneStart).forEach(([wid, t]) => {
+      if (t < since) return;
+      const w = watchlist.find(x => String(x.id) === wid);
+      const n = allListings.filter(l => String(l.watchlist_id) === wid).length;
+      events.push({ kind: "zone", at: t, label: w ? w.label : "Zone", region: w ? w.region : "", count: n });
+    });
+
+    allListings.forEach(l => {
+      const first = new Date(l.first_seen).getTime();
+      if (first >= since && first > zoneStart[l.watchlist_id] + 2 * DAY_MS) {
+        events.push({ kind: "new", at: first, listing: l });
+      }
+      (dropsByListing[l.id] || []).forEach(d => {
+        const t = new Date(d.checked_at).getTime();
+        if (t >= since) events.push({ kind: "drop", at: t, listing: l, drop: d });
+      });
+      const last = new Date(l.last_seen || l.last_checked).getTime();
+      if (Date.now() - last > STALE_MS && last >= since) {
+        events.push({ kind: "gone", at: last, listing: l });
+      }
+    });
+    events.sort((a, b) => b.at - a.at);
   }
 
   function formatPrice(price, currency) {
@@ -406,18 +528,22 @@
     if (currency === "USD") return "$" + Math.round(price).toLocaleString("en-US") + " (USD)";
     return Math.round(price).toLocaleString("fr-FR") + " €";
   }
-
+  function fmtDate(t, withYear) {
+    if (!t) return "—";
+    return new Date(t).toLocaleDateString("en-GB", withYear
+      ? { day: "numeric", month: "short", year: "numeric" }
+      : { day: "numeric", month: "short" });
+  }
+  function dayHeading(t) {
+    const d = new Date(t); d.setHours(0, 0, 0, 0);
+    const today = new Date(); today.setHours(0, 0, 0, 0);
+    const diff = Math.round((today - d) / DAY_MS);
+    if (diff === 0) return "Today";
+    if (diff === 1) return "Yesterday";
+    return d.toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "long" });
+  }
   function sourceLabel(source) {
-    const names = {
-      bellesdemeures: "Belles Demeures",
-      bellespierres: "BellesPierres",
-      jamesedition: "JamesEdition",
-      realadvisor: "RealAdvisor",
-      homegate: "Homegate",
-      kyero: "Kyero",
-      luxuryestate: "LuxuryEstate",
-    };
-    return names[source] || source;
+    return { realadvisor: "RealAdvisor", luxuryestate: "LuxuryEstate" }[source] || source;
   }
 
   const TIER_RANK = { green: 0, orange: 1, red: 2 };
@@ -427,86 +553,147 @@
   function isActiveAlert(l) {
     const tier = l.alert_tier;
     if (!tier || tier === "green") return false;
-    const dismissedTier = l.dismissed_tier;
-    // Still counts as active if it's been dismissed at a LOWER tier than
-    // its current tier (i.e. it escalated since being dismissed).
-    if (l.dismissed_at && TIER_RANK[dismissedTier] >= TIER_RANK[tier]) return false;
+    if (l.dismissed_at && TIER_RANK[l.dismissed_tier] >= TIER_RANK[tier]) return false;
     return true;
+  }
+  function isStale(l) {
+    return Date.now() - new Date(l.last_seen || l.last_checked).getTime() > STALE_MS;
+  }
+  function lastDrop(l) {
+    const d = dropsByListing[l.id];
+    if (d && d.length) return d[d.length - 1];
+    if (l.price_dropped_at) return { checked_at: l.price_dropped_at, pct: l.price_change_pct };
+    return null;
+  }
+  function firstPrice(l) {
+    const d = dropsByListing[l.id];
+    return d && d.length ? d[0].prev_price : null;
+  }
+  function latestActivity(l) {
+    const d = lastDrop(l);
+    return Math.max(new Date(l.first_seen).getTime(), d ? new Date(d.checked_at).getTime() : 0);
+  }
+
+  function datesBlock(l) {
+    const parts = [`Tracked since <strong>${fmtDate(l.first_seen, true)}</strong>`];
+    const drops = dropsByListing[l.id] || [];
+    if (drops.length) {
+      const fp = firstPrice(l);
+      const total = fp ? Math.round(1000 * (fp - l.current_price) / fp) / 10 : null;
+      parts.push(`${drops.length} price cut${drops.length > 1 ? "s" : ""}, last on <strong>${fmtDate(drops[drops.length - 1].checked_at)}</strong>` +
+        (total ? ` (total −${total}%)` : ""));
+    } else if (l.price_dropped_at) {
+      parts.push(`Last price cut on <strong>${fmtDate(l.price_dropped_at)}</strong>`);
+    }
+    if (isStale(l)) {
+      parts.push(`Not seen on the portal since <strong>${fmtDate(l.last_seen || l.last_checked)}</strong>`);
+    }
+    return `<div class="dates">${parts.join("<br>")}</div>`;
+  }
+
+  function alertBlock(l) {
+    if (!isActiveAlert(l)) return "";
+    const reasons = (l.alert_reasons || "").split("\n").filter(Boolean);
+    return `<div class="drop-badge tier-${l.alert_tier}">${TIER_EMOJI[l.alert_tier] || ""} ${TIER_LABEL[l.alert_tier] || ""}
+      <ul class="reasons">${reasons.map(r => `<li>${r}</li>`).join("")}</ul>
+      <button class="dismiss-btn" onclick="dismissAlert(${l.id})" title="Hide until this listing gets worse">Dismiss</button>
+    </div>`;
+  }
+
+  function listingCard(l, opts = {}) {
+    const agency = l.agency
+      ? `<div class="agency"><span class="label">Agency</span> ${l.agency}</div>` : "";
+    const oldPrice = opts.prevPrice ? `<span class="price-old">${formatPrice(opts.prevPrice, l.currency)}</span>` : "";
+    return `
+      <div class="card ${opts.unseen ? "unseen" : ""} ${isStale(l) ? "stale" : ""}" id="card-${l.id}">
+        ${opts.kind || ""}
+        <div class="addr">${l.address || "Address unknown"}</div>
+        <div class="meta">${l.title || ""} · ${l.region} · ${sourceLabel(l.source)}</div>
+        <div class="price-row"><div class="price">${oldPrice}${formatPrice(l.current_price, l.currency)}</div></div>
+        ${alertBlock(l)}
+        ${datesBlock(l)}
+        ${agency}
+        <div class="footer-row"><span class="checked"></span>
+          <a class="view-link" href="${l.url}" target="_blank" rel="noopener">View listing ↗</a></div>
+      </div>`;
+  }
+
+  function eventCard(e, unseen) {
+    const badge = unseen ? `<span class="unseen-dot">NEW</span>` : "";
+    if (e.kind === "zone") {
+      return `<div class="card ${unseen ? "unseen" : ""}"><div class="event-kind zone">Zone added${badge}</div>
+        <div class="addr">${e.label}</div>
+        <div class="meta">${e.count} listings now tracked</div></div>`;
+    }
+    const l = e.listing;
+    if (e.kind === "drop") {
+      return listingCard(l, { unseen, prevPrice: e.drop.prev_price,
+        kind: `<div class="event-kind drop">Price cut −${e.drop.pct}%${badge}</div>` });
+    }
+    if (e.kind === "new") {
+      return listingCard(l, { unseen, kind: `<div class="event-kind new">New listing${badge}</div>` });
+    }
+    return listingCard(l, { unseen, kind: `<div class="event-kind gone">No longer on the portal${badge}</div>` });
   }
 
   function render() {
-    let rows = allListings;
-    if (currentFilter === "alerts") {
-      rows = rows.filter(isActiveAlert);
-      rows = rows.filter(l => TIER_RANK[l.alert_tier] >= TIER_RANK[tierThreshold]);
-    }
-    if (currentRegion) {
-      rows = rows.filter(l => l.region === currentRegion);
-    }
-
-    document.getElementById("result-count").textContent =
-      `${rows.length} ${rows.length === 1 ? "property" : "properties"}`;
-
+    const seenUntil = getSeenUntil();
     const content = document.getElementById("content");
+    const inRegion = x => !currentRegion || x === currentRegion;
+    let html = "";
+    let n = 0;
 
-    if (rows.length === 0) {
-      content.innerHTML = `<div class="empty">No properties match this view yet. ${
-        currentFilter === "alerts" ? "Alerts appear here once a listing's history shows a real pattern - a second reduction, a long time on market, a meaningful cumulative drop. A single price check isn't enough on its own." : ""
-      }</div>`;
+    if (currentView === "activity") {
+      const rows = events.filter(e => inRegion(e.kind === "zone" ? e.region : e.listing.region));
+      n = rows.length;
+      const unseenCount = rows.filter(e => e.at > seenUntil).length;
+      document.getElementById("result-count").textContent =
+        `${n} event${n === 1 ? "" : "s"} in the last ${ACTIVITY_DAYS} days` + (unseenCount ? `, ${unseenCount} new since your last visit` : "");
+      let lastDay = "";
+      rows.forEach(e => {
+        const day = dayHeading(e.at);
+        if (day !== lastDay) { html += `<div class="day-head">${day}</div>`; lastDay = day; }
+        html += eventCard(e, e.at > seenUntil);
+      });
+      content.innerHTML = n ? html : `<div class="empty">Nothing happened in the last ${ACTIVITY_DAYS} days in this region.</div>`;
       return;
     }
 
-    content.innerHTML = rows.map(l => {
-      const active = isActiveAlert(l);
-      const reasons = (l.alert_reasons || "").split("\n").filter(Boolean);
-      const alertBadge = active
-        ? `<div class="drop-badge tier-${l.alert_tier}">${TIER_EMOJI[l.alert_tier] || ""} ${TIER_LABEL[l.alert_tier] || ""}
-             <ul class="reasons">${reasons.map(r => `<li>${r}</li>`).join("")}</ul>
-             <button class="dismiss-btn" onclick="dismissAlert(${l.id})" title="Mark as seen/handled">Dismiss</button>
-           </div>`
-        : "";
-      const isNew = l.first_seen && (Date.now() - new Date(l.first_seen).getTime()) < NEW_LISTING_MS;
-      const newBadge = isNew ? `<div class="new-badge">🆕 New listing</div>` : "";
-      const agencyRow = l.agency
-        ? `<div class="agency"><span class="label">Agency</span> ${l.agency}</div>`
-        : `<div class="agency"><span class="label">Agency</span> Not extracted — open the listing</div>`;
-      const checkedDate = l.last_checked
-        ? new Date(l.last_checked).toLocaleDateString("fr-FR", { day: "numeric", month: "short" })
-        : "—";
-
-      return `
-        <div class="card" id="card-${l.id}">
-          <div class="addr">${l.address || "Address unknown"}</div>
-          <div class="meta">${l.title || ""} · ${l.region} · ${sourceLabel(l.source)}</div>
-          <div class="price-row">
-            <div class="price">${formatPrice(l.current_price, l.currency)}</div>
-            ${newBadge}
-          </div>
-          ${alertBadge}
-          ${agencyRow}
-          <div class="footer-row">
-            <span class="checked">Checked ${checkedDate}</span>
-            <a class="view-link" href="${l.url}" target="_blank" rel="noopener">View listing ↗</a>
-          </div>
-        </div>`;
-    }).join("");
+    let rows = allListings.filter(l => inRegion(l.region));
+    if (currentView === "alerts") {
+      rows = rows.filter(isActiveAlert)
+        .sort((a, b) => (TIER_RANK[b.alert_tier] - TIER_RANK[a.alert_tier]) || (latestActivity(b) - latestActivity(a)));
+    } else {
+      const sorters = {
+        activity: (a, b) => latestActivity(b) - latestActivity(a),
+        drop: (a, b) => {
+          const pa = firstPrice(a) ? (firstPrice(a) - a.current_price) / firstPrice(a) : 0;
+          const pb = firstPrice(b) ? (firstPrice(b) - b.current_price) / firstPrice(b) : 0;
+          return pb - pa;
+        },
+        price: (a, b) => (b.current_price || 0) - (a.current_price || 0),
+        since: (a, b) => new Date(a.first_seen) - new Date(b.first_seen),
+      };
+      rows = rows.slice().sort(sorters[currentSort]);
+    }
+    n = rows.length;
+    document.getElementById("result-count").textContent = `${n} ${n === 1 ? "property" : "properties"}`;
+    content.innerHTML = n
+      ? rows.map(l => listingCard(l, { unseen: latestActivity(l) > seenUntil && currentView === "alerts" })).join("")
+      : `<div class="empty">${currentView === "alerts"
+          ? "No open alert. Alerts appear once a listing's history shows a real pattern: repeated cuts, a long time on market, a meaningful cumulative drop."
+          : "No property in this region yet."}</div>`;
   }
-
-  const NEW_LISTING_MS = 3 * 24 * 60 * 60 * 1000;
 
   async function dismissAlert(listingId) {
     try {
       const res = await fetch(`${SUPABASE_URL}/rest/v1/rpc/dismiss_alert`, {
         method: "POST",
-        headers: {
-          apikey: SUPABASE_ANON_KEY,
-          Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
-          "Content-Type": "application/json",
-        },
+        headers: { ...AUTH, "Content-Type": "application/json" },
         body: JSON.stringify({ listing_id: listingId }),
       });
       if (!res.ok) throw new Error(`Dismiss failed: ${res.status}`);
-      const item = allListings.find(l => l.id === listingId);
+      const item = listingById[listingId];
       if (item) {
         item.dismissed_at = new Date().toISOString();
         item.dismissed_tier = item.alert_tier;
@@ -521,34 +708,26 @@
   const REGION_LABEL = { "Cote d'Azur": "Côte d'Azur", "Alpes": "Alpes", "Costa del Sol": "Costa del Sol", "Geneve": "Genève" };
 
   function renderStatus() {
-    const total = allListings.length;
+    const live = allListings.filter(l => !isStale(l));
     const counts = {};
-    allListings.forEach(l => { counts[l.region] = (counts[l.region] || 0) + 1; });
+    live.forEach(l => { counts[l.region] = (counts[l.region] || 0) + 1; });
+    const firstSeen = allListings.map(l => new Date(l.first_seen).getTime()).filter(Boolean);
+    const earliest = firstSeen.length ? Math.min(...firstSeen) : null;
+    const daysTracking = earliest ? Math.max(1, Math.round((Date.now() - earliest) / DAY_MS)) : 0;
+    const lastChecked = allListings.map(l => new Date(l.last_checked).getTime()).filter(Boolean);
+    const lastRun = lastChecked.length ? Math.max(...lastChecked) : null;
+    const withDrop = allListings.filter(l => (dropsByListing[l.id] || []).length || l.price_dropped_at).length;
 
-    const firstSeenDates = allListings.map(l => l.first_seen).filter(Boolean).map(d => new Date(d));
-    const earliest = firstSeenDates.length ? new Date(Math.min(...firstSeenDates)) : null;
-    const daysTracking = earliest ? Math.max(1, Math.round((Date.now() - earliest.getTime()) / 86400000)) : 0;
-
-    const lastCheckedDates = allListings.map(l => l.last_checked).filter(Boolean).map(d => new Date(d));
-    const lastRun = lastCheckedDates.length ? new Date(Math.max(...lastCheckedDates)) : null;
-
-    const withDrop = allListings.filter(l => l.price_dropped_at).length;
-
-    const statsHtml = `
-      <div class="status-stat"><div class="num">${total}</div><div class="lbl">Listings</div></div>
-      <div class="status-stat"><div class="num">${daysTracking}</div><div class="lbl">Day${daysTracking === 1 ? "" : "s"} tracked</div></div>
-      <div class="status-stat"><div class="num">${withDrop}</div><div class="lbl">With a drop</div></div>
-      ${REGION_ORDER.map(r => `<div class="status-stat"><div class="num">${counts[r] || 0}</div><div class="lbl">${REGION_LABEL[r]}</div></div>`).join("")}
-    `;
-    document.getElementById("status-stats").innerHTML = statsHtml;
-
-    document.getElementById("status-note").textContent = withDrop === 0
-      ? `No price reductions recorded yet — expected this early (tracking started ${earliest ? earliest.toLocaleDateString("fr-FR", { day: "numeric", month: "short" }) : "recently"}). Luxury listings reprice infrequently; alerts below will populate as real patterns emerge.`
-      : `${withDrop} listing${withDrop === 1 ? "" : "s"} with at least one recorded reduction so far.`;
-
+    document.getElementById("status-stats").innerHTML = `
+      <div class="status-stat"><div class="num">${live.length}</div><div class="lbl">Live listings</div></div>
+      <div class="status-stat"><div class="num">${daysTracking}</div><div class="lbl">Days tracked</div></div>
+      <div class="status-stat"><div class="num">${withDrop}</div><div class="lbl">With a cut</div></div>
+      ${REGION_ORDER.map(r => `<div class="status-stat"><div class="num">${counts[r] || 0}</div><div class="lbl">${REGION_LABEL[r]}</div></div>`).join("")}`;
+    document.getElementById("status-note").textContent =
+      `${withDrop} listing${withDrop === 1 ? "" : "s"} with at least one price cut since tracking started on ${earliest ? fmtDate(earliest, true) : "—"}. ` +
+      `${allListings.length - live.length} listing${allListings.length - live.length === 1 ? "" : "s"} no longer seen on the portals.`;
     document.getElementById("status-lastrun").textContent = lastRun
-      ? `Last scrape: ${lastRun.toLocaleDateString("fr-FR", { day: "numeric", month: "short" })} at ${lastRun.toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" })}`
-      : "";
+      ? `Last scan: ${fmtDate(lastRun)} at ${new Date(lastRun).toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" })}` : "";
   }
 
   document.getElementById("status-toggle").addEventListener("click", () => {
@@ -556,29 +735,15 @@
     body.hidden = !body.hidden;
     document.getElementById("status-toggle").textContent = `Tracking status & alert guide ${body.hidden ? "▾" : "▴"}`;
   });
-
-  document.getElementById("filter-alerts").addEventListener("click", (e) => {
-    currentFilter = "alerts";
-    document.querySelectorAll(".controls button").forEach(b => b.classList.remove("active"));
-    e.target.classList.add("active");
-    document.getElementById("tier-threshold").disabled = false;
+  document.querySelectorAll("[data-view]").forEach(btn => btn.addEventListener("click", () => {
+    currentView = btn.dataset.view;
+    document.querySelectorAll("[data-view]").forEach(b => b.classList.toggle("active", b === btn));
+    document.getElementById("sort-select").hidden = currentView !== "all";
     render();
-  });
-  document.getElementById("filter-all").addEventListener("click", (e) => {
-    currentFilter = "all";
-    document.querySelectorAll(".controls button").forEach(b => b.classList.remove("active"));
-    e.target.classList.add("active");
-    document.getElementById("tier-threshold").disabled = true;
-    render();
-  });
-  document.getElementById("tier-threshold").addEventListener("change", (e) => {
-    tierThreshold = e.target.value;
-    render();
-  });
-  document.getElementById("region-select").addEventListener("change", (e) => {
-    currentRegion = e.target.value;
-    render();
-  });
+  }));
+  document.getElementById("sort-select").addEventListener("change", e => { currentSort = e.target.value; render(); });
+  document.getElementById("region-select").addEventListener("change", e => { currentRegion = e.target.value; render(); });
+  document.getElementById("mark-seen").addEventListener("click", () => { setSeenUntil(Date.now()); render(); });
 
   if ("serviceWorker" in navigator) {
     navigator.serviceWorker.register("service-worker.js").catch(() => {});
