@@ -370,7 +370,7 @@
 <header>
   <div class="eyebrow">PrimeAuctions</div>
   <h1>Price Tracker</h1>
-  <p>Has anything happened in the market that suggests an auction opportunity? The activity feed shows every event, newest first.</p>
+  <p>Has anything happened in the market that suggests an auction opportunity? The activity feed shows every price cut, newest first.</p>
 </header>
 
 <div class="controls">
@@ -384,6 +384,11 @@
   <button id="view-activity" class="active" data-view="activity">Activity</button>
   <button id="view-alerts" data-view="alerts">Alerts</button>
   <button id="view-all" data-view="all">All properties</button>
+  <select id="kind-select">
+    <option value="cuts">Price cuts</option>
+    <option value="cuts+gone">Price cuts + no longer online</option>
+    <option value="all">Everything (incl. new listings)</option>
+  </select>
   <select id="sort-select" hidden>
     <option value="activity">Latest activity first</option>
     <option value="drop">Biggest drop first</option>
@@ -433,6 +438,12 @@
   let currentView = "activity";
   let currentRegion = "";
   let currentSort = "activity";
+  let currentKinds = "cuts";
+  const KIND_SETS = {
+    "cuts": ["drop", "zone"],
+    "cuts+gone": ["drop", "zone", "gone"],
+    "all": ["drop", "zone", "gone", "new"],
+  };
 
   function getSeenUntil() {
     try { return Number(localStorage.getItem(SEEN_KEY)) || 0; } catch (e) { return 0; }
@@ -644,7 +655,8 @@
     let n = 0;
 
     if (currentView === "activity") {
-      const rows = events.filter(e => inRegion(e.kind === "zone" ? e.region : e.listing.region));
+      const kinds = KIND_SETS[currentKinds];
+      const rows = events.filter(e => kinds.includes(e.kind) && inRegion(e.kind === "zone" ? e.region : e.listing.region));
       n = rows.length;
       const unseenCount = rows.filter(e => e.at > seenUntil).length;
       document.getElementById("result-count").textContent =
@@ -739,9 +751,11 @@
     currentView = btn.dataset.view;
     document.querySelectorAll("[data-view]").forEach(b => b.classList.toggle("active", b === btn));
     document.getElementById("sort-select").hidden = currentView !== "all";
+    document.getElementById("kind-select").hidden = currentView !== "activity";
     render();
   }));
   document.getElementById("sort-select").addEventListener("change", e => { currentSort = e.target.value; render(); });
+  document.getElementById("kind-select").addEventListener("change", e => { currentKinds = e.target.value; render(); });
   document.getElementById("region-select").addEventListener("change", e => { currentRegion = e.target.value; render(); });
   document.getElementById("mark-seen").addEventListener("click", () => { setSeenUntil(Date.now()); render(); });
 

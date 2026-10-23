@@ -549,10 +549,11 @@ def _fmt_eur(v):
 def notify_daily_digest(digest, alerts_raised):
     """
     One Slack message per run, every run, even when nothing happened.
-    It lists every price drop (however small) and every new listing, so the
-    tracker visibly lives day to day, without touching the alert thresholds
-    in compute_alert. It also doubles as a heartbeat: no digest in Slack
-    means the run did not complete.
+    It lists every price drop (however small), so the tracker visibly lives
+    day to day without touching the alert thresholds in compute_alert. New
+    listings are deliberately left out: they are not an auction signal. The
+    first line doubles as a heartbeat: no digest in Slack means the run did
+    not complete.
     """
     if not SLACK_WEBHOOK_URL:
         return
@@ -572,15 +573,6 @@ def notify_daily_digest(digest, alerts_raised):
             lines.append(f"• ...and {len(drops) - 15} more on the dashboard")
     else:
         lines.append("\nNo price drop today.")
-
-    new = sorted(digest["new"], key=lambda i: i["price"] or 0, reverse=True)
-    if new:
-        lines.append(f"\n*New listings ({len(new)})*")
-        for item in new[:10]:
-            lines.append(f"• {_fmt_eur(item['price'])} {item['title'] or 'Property'} "
-                         f"({item['address'] or '?'}) <{item['url']}|view>")
-        if len(new) > 10:
-            lines.append(f"• ...and {len(new) - 10} more on the dashboard")
 
     for label, n in digest["baselines"]:
         lines.append(f"\n:new: Zone added: *{label}*, {n} listings now tracked")
