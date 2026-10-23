@@ -25,7 +25,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install requests beautifulsoup4
+        run: pip install requests beautifulsoup4 pywebpush
 
       - name: Run scraper (diagnose mode)
         if: ${{ github.event.inputs.diagnose_id != '' }}
@@ -41,5 +41,6 @@ jobs:
           SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           SCRAPE_EVERY_N_DAYS: "3"
+          VAPID_PRIVATE_KEY: ${{ secrets.VAPID_PRIVATE_KEY }}
           FULL_RUN: ${{ github.event.inputs.full_run }}
         run: python scraper.py
