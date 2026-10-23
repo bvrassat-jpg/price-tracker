@@ -463,6 +463,11 @@
 
   // NEW = happened after the last "Mark all as seen" on this device. On the
   // very first visit there is no such moment yet: use "the last 7 days".
+  // Bump on every release. The page compares it with the copy on GitHub and
+  // reloads itself if a newer version exists, so phones never stay on an
+  // old cached copy.
+  const APP_VERSION = "2026-10-23.4";
+
   // Data loads first, so an optional feature failing below can never leave the page empty.
   setTimeout(() => loadData(), 0);
 
@@ -838,8 +843,8 @@
       ${regions.map(r => `<div class="status-stat"><div class="num">${counts[r] || 0}</div><div class="lbl">${label[r] || r}</div></div>`).join("")}`;
     document.getElementById("status-note").textContent =
       `${allListings.length} listings in the database correspond to ${groups.length} distinct properties (the rest are the same property listed by several agencies).`;
-    document.getElementById("status-lastrun").textContent = lastRun
-      ? `Last scan: ${fmtDate(lastRun)} at ${new Date(lastRun).toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" })}` : "";
+    document.getElementById("status-lastrun").textContent = (lastRun
+      ? `Last scan: ${fmtDate(lastRun)} at ${new Date(lastRun).toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" })}. ` : "") + `App version ${APP_VERSION}.`;
   }
 
   document.getElementById("status-toggle").addEventListener("click", () => {
@@ -858,7 +863,27 @@
   document.getElementById("sort-select").addEventListener("change", e => { currentSort = e.target.value; render(); });
   document.getElementById("kind-select").addEventListener("change", e => { currentKinds = e.target.value; render(); });
   document.getElementById("region-select").addEventListener("change", e => { currentRegion = e.target.value; render(); });
-  document.getElementById("mark-seen").addEventListener("click", () => { setSeenUntil(Date.now()); render(); });
+  document.getElementById("mark-seen").addEventListener("click", () => {
+    setSeenUntil(Date.now());
+    render();
+    const btn = document.getElementById("mark-seen");
+    btn.textContent = "✓ All marked as seen";
+    setTimeout(() => { btn.textContent = "Mark all as seen"; }, 2500);
+  });
+
+  // Self-update: if GitHub has a newer version than the one running, reload once.
+  (async () => {
+    try {
+      const res = await fetch(`dashboard.html?check=${Date.now()}`, { cache: "no-store" });
+      const html = await res.text();
+      const m = html.match(/APP_VERSION = "([^"]+)"/);
+      const flag = "pt_reloaded_for";
+      if (m && m[1] > APP_VERSION && sessionStorage.getItem(flag) !== m[1]) {  // only ever move forward
+        sessionStorage.setItem(flag, m[1]);
+        location.reload();
+      }
+    } catch (e) { /* offline: keep the running version */ }
+  })();
 
   // ---- Alert badge and push notifications -----------------------------------
   // Badge on the app icon = number of open alerts (not dismissed), counted
@@ -916,7 +941,8 @@
   document.getElementById("notify-btn").addEventListener("click", enableNotifications);
 
   try {
-    if ("serviceWorker" in navigator) navigator.serviceWorker.register("service-worker.js").then(refreshNotifyButton).catch(() => {});
+    if ("serviceWorker" in navigator) navigator.serviceWorker.register("service-worker.js", { updateViaCache: "none" })
+      .then(reg => { reg.update().catch(() => {}); refreshNotifyButton(); }).catch(() => {});
   } catch (e) { /* the app works without it */ }
 </script>
 
