@@ -2,13 +2,17 @@ name: price-tracker
 
 on:
   schedule:
-    - cron: "0 6 * * *"   # daily at 06:00 UTC - the real automated run
+    - cron: "0 6 * * *"   # daily at 06:00 UTC; each run covers 1/3 of the zones (rotation)
   workflow_dispatch:        # lets you trigger it manually from the Actions tab
     inputs:
       diagnose_id:
         description: "Watchlist id to test in diagnose mode (leave blank for a real run)"
         required: false
         default: ""
+      full_run:
+        description: "Scrape every zone now, ignoring the 1-day-in-3 rotation (true/false)"
+        required: false
+        default: "false"
 
 jobs:
   run:
@@ -36,4 +40,6 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SCRAPE_EVERY_N_DAYS: "3"
+          FULL_RUN: ${{ github.event.inputs.full_run }}
         run: python scraper.py
