@@ -2,7 +2,7 @@
   "name": "PrimeAuctions Price Tracker",
   "short_name": "Price Tracker",
   "description": "Property price-drop tracker for PrimeAuctions business development",
-  "start_url": "./dashboard.html",
+  "start_url": "./dashboard.html?app=1",
   "scope": "./",
   "display": "standalone",
   "orientation": "portrait",
