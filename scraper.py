@@ -576,6 +576,77 @@ def record_scan(watchlist_id, complete, pages_read):
         print(f"  (could not record scan status: {e})")
 
 
+VAPID_PRIVATE_KEY = os.environ.get("VAPID_PRIVATE_KEY", "")
+VAPID_SUBJECT = os.environ.get("VAPID_SUBJECT", "mailto:brassat@primeauctionsglobal.com")
+
+
+def count_open_alerts():
+    """Open (not dismissed) orange/red alerts, counted per property: the same
+    villa listed by several agencies counts once, as on the dashboard."""
+    wl = requests.get(f"{SUPABASE_URL}/rest/v1/pt_watchlist?active=eq.true&select=id",
+                      headers=HEADERS_SUPABASE, timeout=30)
+    wl.raise_for_status()
+    active = {w["id"] for w in wl.json()}
+    r = requests.get(
+        f"{SUPABASE_URL}/rest/v1/pt_listings?alert_tier=in.(orange,red)"
+        f"&select=watchlist_id,current_price,price_per_sqm,alert_tier,dismissed_at,dismissed_tier",
+        headers=HEADERS_SUPABASE, timeout=30)
+    r.raise_for_status()
+    keys = set()
+    for l in r.json():
+        if l["watchlist_id"] not in active:
+            continue
+        if l.get("dismissed_at") and TIER_RANK.get(l.get("dismissed_tier"), 0) >= TIER_RANK.get(l["alert_tier"], 0):
+            continue
+        area = round(l["current_price"] / l["price_per_sqm"]) if l.get("price_per_sqm") and l.get("current_price") else None
+        keys.add((l["current_price"], area))
+    return len(keys)
+
+
+def send_alert_push(alerts_raised):
+    """
+    Push notification to every phone that pressed "Alert me" in the app. The
+    service worker shows the notification and sets the red badge on the app
+    icon to the number of open alerts. Only new or escalated alerts trigger
+    it, never ordinary activity.
+    """
+    if not VAPID_PRIVATE_KEY:
+        print("  (push skipped: VAPID_PRIVATE_KEY not set)")
+        return
+    try:
+        from pywebpush import webpush, WebPushException
+    except ImportError:
+        print("  (push skipped: pywebpush not installed)")
+        return
+    r = requests.get(f"{SUPABASE_URL}/rest/v1/pt_push_subscriptions?select=id,subscription",
+                     headers=HEADERS_SUPABASE, timeout=30)
+    r.raise_for_status()
+    subs = r.json()
+    if not subs:
+        return
+    first = alerts_raised[0]
+    body = f"{first.get('title') or 'Property'}, {first.get('address') or ''}: {_fmt_eur(first['price'])} \u20ac"
+    if len(alerts_raised) > 1:
+        body += f" (+{len(alerts_raised) - 1} more)"
+    payload = json.dumps({
+        "title": "New alert" if len(alerts_raised) == 1 else f"{len(alerts_raised)} new alerts",
+        "body": body,
+        "badge": count_open_alerts(),
+    })
+    for s in subs:
+        try:
+            webpush(subscription_info=s["subscription"], data=payload,
+                    vapid_private_key=VAPID_PRIVATE_KEY, vapid_claims={"sub": VAPID_SUBJECT}, ttl=86400)
+        except WebPushException as e:
+            status = getattr(e.response, "status_code", None)
+            if status in (404, 410):  # phone unsubscribed or app removed: forget it
+                requests.delete(f"{SUPABASE_URL}/rest/v1/pt_push_subscriptions?id=eq.{s['id']}",
+                                headers=HEADERS_SUPABASE, timeout=30)
+            else:
+                print(f"  (push failed: {e})")
+    print(f"  push sent to {len(subs)} device(s)")
+
+
 def watchlist_has_listings(watchlist_id):
     r = requests.get(
         f"{SUPABASE_URL}/rest/v1/pt_listings?watchlist_id=eq.{watchlist_id}&select=id&limit=1",
@@ -1051,6 +1122,8 @@ def run(diagnose_id=None):
             notify_slack_source_failures(source, failures, entries_per_source.get(source, len(failures)))
         notify_slack_run_errors(run_errors)
         notify_daily_digest(digest, alerts_raised)
+        if alerts_raised:
+            send_alert_push(alerts_raised)
         print(f"\n{len(alerts_raised)} new/escalated alert(s) raised across all watchlist entries.")
         if run_errors:
             print(f"{len(run_errors)} watchlist entr"

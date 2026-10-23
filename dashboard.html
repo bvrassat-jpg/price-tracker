@@ -414,6 +414,7 @@
     <option value="price">Highest price first</option>
     <option value="since">Longest on market first</option>
   </select>
+  <button id="notify-btn" hidden title="Get a notification and a red badge on the app icon when a new alert appears">🔔 Alert me</button>
   <button id="mark-seen" class="seen-btn" title="Everything currently shown as NEW becomes seen">Mark all as seen</button>
   <div class="count" id="result-count"></div>
 </div>
@@ -450,6 +451,8 @@
   const ACTIVITY_DAYS = 60;
   const MIN_SAMPLE = 20;   // below this, market figures are shown greyed out
   const SEEN_KEY = "pt_seen_until";
+  // Public half of the push key pair (the private half is a GitHub secret).
+  const VAPID_PUBLIC_KEY = "BMaGpyjL6rj9x_4F3acJ7-HB4RM0y8xEB-GfPWyabcrSAdeYYruRU7GiP36mL7pqRCk-iQdPJmL9wN_j3n_xMVg";
 
   let allListings = [], listingById = {}, dropsByListing = {}, watchlistById = {};
   let groups = [], groupOf = {};
@@ -489,7 +492,8 @@
       buildGroups();
       buildEvents();
       renderStatus();
-      render();
+      if (location.hash === "#alerts") document.querySelector('[data-view=alerts]').click(); else render();
+      updateBadge();
     } catch (err) {
       document.getElementById("content").innerHTML = `<div class="error">Couldn't load data: ${err.message}.</div>`;
     }
@@ -682,6 +686,21 @@
     let html = `<div class="mkt-note">Asking prices on LuxuryEstate, properties at €5M and above, each property counted once even when several agencies list it.
       Tracking since ${fmtDate(earliest, true)}. "On the market" durations start at the first day a property was tracked, so they are minimums.
       Removals are only counted in zones whose last scan read every results page.</div>`;
+    const cmp = regions.map(r => marketStats(groups.filter(g => g.rep.region === r),
+      Object.values(watchlistById).filter(w => w.active && w.region === r).map(w => w.id)));
+    const rowsDef = [
+      ["Properties on the market", s => s.n],
+      ["Cut their price since tracking began", s => pct(s.cutEver)],
+      ["Cut in the last 30 days", s => pct(s.cut30)],
+      ["Typical cut", s => s.medCut === null ? "—" : "−" + pct(s.medCut, 1)],
+      ["Typical total drop (cut properties)", s => s.medTotal === null ? "—" : "−" + pct(s.medTotal, 1)],
+      ["Median asking price", s => meur(s.price)],
+      ["Median price per m²", s => eur(s.ppsqm)],
+    ];
+    const rName = r => ({ "Cote d'Azur": "Côte d'Azur", "Geneve": "Genève" }[r] || r);
+    html += `<div class="mkt-region"><h2>Comparison</h2><div class="zone-scroll"><table class="mkt-zones"><thead><tr><th></th>${regions.map(r => `<th>${rName(r)}</th>`).join("")}</tr></thead><tbody>
+      ${rowsDef.map(([label, f]) => `<tr><td>${label}</td>${cmp.map(s => `<td style="${s.n < MIN_SAMPLE ? "color:var(--text-dim)" : ""}">${f(s)}</td>`).join("")}</tr>`).join("")}
+      </tbody></table></div></div>`;
     regions.forEach(r => {
       const gs = groups.filter(g => g.rep.region === r);
       const zoneIds = Object.values(watchlistById).filter(w => w.active && w.region === r).map(w => w.id);
@@ -768,6 +787,7 @@
         m.dismissed_tier = m.alert_tier;
       }
       render();
+      updateBadge();
     } catch (err) {
       alert("Couldn't dismiss this alert: " + err.message);
     }
@@ -812,7 +832,61 @@
   document.getElementById("region-select").addEventListener("change", e => { currentRegion = e.target.value; render(); });
   document.getElementById("mark-seen").addEventListener("click", () => { setSeenUntil(Date.now()); render(); });
 
-  if ("serviceWorker" in navigator) navigator.serviceWorker.register("service-worker.js").catch(() => {});
+  // ---- Alert badge and push notifications -----------------------------------
+  // Badge on the app icon = number of open alerts (not dismissed), counted
+  // per property. It is refreshed when the app opens and when an alert is
+  // dismissed; while the app is closed, a push from the scraper updates it.
+  function openAlertCount() { return groups.filter(g => groupAlert(g)).length; }
+  function updateBadge() {
+    const n = openAlertCount();
+    try {
+      if ("setAppBadge" in navigator) (n > 0 ? navigator.setAppBadge(n) : navigator.clearAppBadge()).catch(() => {});
+    } catch (e) { /* unsupported */ }
+  }
+  const pushSupported = () => "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
+  const isIOS = /iphone|ipad|ipod/i.test(navigator.userAgent);
+  const isStandalone = window.matchMedia("(display-mode: standalone)").matches || navigator.standalone === true;
+  function b64ToUint8(b64) {
+    const pad = "=".repeat((4 - b64.length % 4) % 4);
+    const raw = atob((b64 + pad).replace(/-/g, "+").replace(/_/g, "/"));
+    return Uint8Array.from([...raw].map(c => c.charCodeAt(0)));
+  }
+  async function refreshNotifyButton() {
+    const btn = document.getElementById("notify-btn");
+    if (isIOS && !isStandalone) { btn.hidden = false; btn.textContent = "🔔 Alert me"; return; }
+    if (!pushSupported()) { btn.hidden = true; return; }
+    const reg = await navigator.serviceWorker.ready;
+    const sub = await reg.pushManager.getSubscription();
+    btn.hidden = false;
+    btn.textContent = sub && Notification.permission === "granted" ? "🔔 Alerts on" : "🔔 Alert me";
+  }
+  async function enableNotifications() {
+    if (isIOS && !isStandalone) {
+      alert("On iPhone, notifications only work from the app icon: tap Share, then \"Add to Home Screen\", open Price Tracker from that icon and press this button again.");
+      return;
+    }
+    if (!pushSupported()) { alert("This browser can't receive notifications."); return; }
+    try {
+      const perm = await Notification.requestPermission();
+      if (perm !== "granted") { alert("Notifications are blocked for this app. Allow them in the phone's settings, then try again."); return; }
+      const reg = await navigator.serviceWorker.ready;
+      const sub = (await reg.pushManager.getSubscription()) ||
+        await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64ToUint8(VAPID_PUBLIC_KEY) });
+      const res = await fetch(`${SUPABASE_URL}/rest/v1/rpc/save_push_subscription`, {
+        method: "POST", headers: { ...AUTH, "Content-Type": "application/json" },
+        body: JSON.stringify({ sub: sub.toJSON(), ua: navigator.userAgent.slice(0, 200) }),
+      });
+      if (!res.ok) throw new Error(`could not save the subscription (${res.status})`);
+      updateBadge();
+      refreshNotifyButton();
+      alert("Done. You'll get a notification and a badge on the app icon when a new alert appears.");
+    } catch (err) {
+      alert("Couldn't turn on notifications: " + err.message);
+    }
+  }
+  document.getElementById("notify-btn").addEventListener("click", enableNotifications);
+
+  if ("serviceWorker" in navigator) navigator.serviceWorker.register("service-worker.js").then(refreshNotifyButton).catch(() => {});
   loadData();
 </script>
 
