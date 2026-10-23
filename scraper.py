@@ -850,6 +850,10 @@ def apply_alert(listing_id, alert_state, alert, item):
         "alert_reasons": "\n".join(alert["reasons"]) if alert["reasons"] else None,
     }
 
+    # Date the listing reached its current alert level, shown on the dashboard
+    if new_tier in ("orange", "red") and TIER_RANK.get(new_tier, 0) > TIER_RANK.get(old_tier, 0):
+        patch["alert_raised_at"] = datetime.now(timezone.utc).isoformat()
+
     if alert_state.get("dismissed_at") and TIER_RANK.get(new_tier, 0) > TIER_RANK.get(dismissed_tier, 0):
         patch["dismissed_at"] = None
         patch["dismissed_tier"] = None

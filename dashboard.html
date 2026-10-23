@@ -430,7 +430,7 @@
       <div class="tier-legend-item"><strong>Points per listing:</strong> 180+ days on market +1 (365+ days +3), 2 or 3 price reductions +1 (4 or more +3), cumulative drop of 7% or more +1 (15% or more +3).</div>
       <div class="tier-legend-item">🟠 <strong>Worth reviewing</strong>: 2 points or more.</div>
       <div class="tier-legend-item">🔴 <strong>Strong signal</strong>: 5 points or more.</div>
-      <div class="tier-legend-item"><strong>NEW</strong> marks anything that happened since you last pressed "Mark all as seen" on this device. Dismissing an alert hides it until the listing gets worse.</div>
+      <div class="tier-legend-item"><strong>NEW</strong> marks anything that happened since you last pressed "Mark all as seen" on this device (on a first visit: the last 7 days). Dismissing an alert hides it until the listing gets worse.</div>
     </div>
   </div>
 </div>
@@ -460,7 +460,20 @@
   let currentView = "activity", currentRegion = "", currentSort = "activity", currentKinds = "cuts";
   const KIND_SETS = { "cuts": ["drop", "zone"], "cuts+gone": ["drop", "zone", "gone"], "all": ["drop", "zone", "gone", "new"] };
 
-  function getSeenUntil() { try { return Number(localStorage.getItem(SEEN_KEY)) || 0; } catch (e) { return 0; } }
+  // NEW = happened after the last "Mark all as seen" on this device. On the
+  // very first visit there is no such moment yet: use "the last 7 days".
+  // Data loads first, so an optional feature failing below can never leave the page empty.
+  setTimeout(() => loadData(), 0);
+
+  function getSeenUntil() {
+    try {
+      const v = Number(localStorage.getItem(SEEN_KEY));
+      if (v) return v;
+      const first = Date.now() - 7 * DAY_MS;
+      localStorage.setItem(SEEN_KEY, String(first));
+      return first;
+    } catch (e) { return Date.now() - 7 * DAY_MS; }
+  }
   function setSeenUntil(ts) { try { localStorage.setItem(SEEN_KEY, String(ts)); } catch (e) { /* private mode */ } }
   const t = d => d ? new Date(d).getTime() : 0;
 
@@ -626,7 +639,8 @@
   function alertBlock(l) {
     if (!l || !isActiveAlert(l)) return "";
     const reasons = (l.alert_reasons || "").split("\n").filter(Boolean);
-    return `<div class="drop-badge tier-${l.alert_tier}">${TIER_EMOJI[l.alert_tier] || ""} ${TIER_LABEL[l.alert_tier] || ""}
+    const raised = l.alert_raised_at ? ` · since ${fmtDate(t(l.alert_raised_at), true)}` : "";
+    return `<div class="drop-badge tier-${l.alert_tier}">${TIER_EMOJI[l.alert_tier] || ""} ${TIER_LABEL[l.alert_tier] || ""}${raised}
       <ul class="reasons">${reasons.map(r => `<li>${r}</li>`).join("")}</ul>
       <button class="dismiss-btn" onclick="dismissGroup(${groupOf[l.id].id})" title="Hide until this listing gets worse">Dismiss</button></div>`;
   }
@@ -758,7 +772,7 @@
     let rows = groups.filter(g => inRegion(g.rep.region));
     if (currentView === "alerts") {
       rows = rows.filter(g => groupAlert(g)).sort((a, b) =>
-        (TIER_RANK[groupAlert(b).alert_tier] - TIER_RANK[groupAlert(a).alert_tier]) || (groupLatestActivity(b) - groupLatestActivity(a)));
+        (t(groupAlert(b).alert_raised_at) - t(groupAlert(a).alert_raised_at)) || (groupLatestActivity(b) - groupLatestActivity(a)));
     } else {
       rows = rows.filter(g => !groupRemoved(g));
       const sorters = {
@@ -769,9 +783,14 @@
       };
       rows.sort(sorters[currentSort]);
     }
-    count.textContent = `${rows.length} ${rows.length === 1 ? "property" : "properties"}`;
+    count.textContent = currentView === "alerts"
+      ? `${rows.length} open alert${rows.length === 1 ? "" : "s"}, newest first`
+      : `${rows.length} ${rows.length === 1 ? "property" : "properties"}`;
     content.innerHTML = rows.length
-      ? rows.map(g => groupCard(g, { unseen: currentView === "alerts" && groupLatestActivity(g) > seenUntil })).join("")
+      ? rows.map(g => {
+          const unseen = currentView === "alerts" && t(groupAlert(g).alert_raised_at) > seenUntil;
+          return groupCard(g, { unseen, kind: unseen ? `<div class="event-kind drop">New alert<span class="unseen-dot">NEW</span></div>` : "" });
+        }).join("")
       : `<div class="empty">${currentView === "alerts" ? "No open alert. Alerts appear once a listing's history shows a real pattern: repeated cuts, a long time on market, a meaningful cumulative drop." : "No property in this region yet."}</div>`;
   }
 
@@ -845,7 +864,8 @@
   }
   const pushSupported = () => "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
   const isIOS = /iphone|ipad|ipod/i.test(navigator.userAgent);
-  const isStandalone = window.matchMedia("(display-mode: standalone)").matches || navigator.standalone === true;
+  let isStandalone = false;
+  try { isStandalone = (window.matchMedia && window.matchMedia("(display-mode: standalone)").matches) || navigator.standalone === true; } catch (e) { /* old browser */ }
   function b64ToUint8(b64) {
     const pad = "=".repeat((4 - b64.length % 4) % 4);
     const raw = atob((b64 + pad).replace(/-/g, "+").replace(/_/g, "/"));
@@ -886,8 +906,9 @@
   }
   document.getElementById("notify-btn").addEventListener("click", enableNotifications);
 
-  if ("serviceWorker" in navigator) navigator.serviceWorker.register("service-worker.js").then(refreshNotifyButton).catch(() => {});
-  loadData();
+  try {
+    if ("serviceWorker" in navigator) navigator.serviceWorker.register("service-worker.js").then(refreshNotifyButton).catch(() => {});
+  } catch (e) { /* the app works without it */ }
 </script>
 
 </body>
